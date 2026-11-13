@@ -168,6 +168,9 @@ release. The download page always links to the latest release. The page itself i
 | `.github/workflows/build.yml` | Tests, builds and releases on GitHub Actions |
 | `docs/index.html` | Download page |
 | `docs/github-brand.css` | Creator banner styling adapted from [Safe Layer](https://davidgcs.github.io/safelayer/) |
+| `docs/assets/favicon.svg` | Page icon: a blue pointer and a red record dot. Also the source of `favicon.ico` (16, 32 and 48 px) and `apple-touch-icon.png` (180 px, drawn without rounded corners) |
+| `docs/assets/social-preview.svg` | Source of the image shown when the page is shared. Render it with `rsvg-convert -w 1200 -h 630 -f png -o docs/assets/social-preview.png docs/assets/social-preview.svg` |
+| `docs/assets/social-preview.png` | The 1200 × 630 share image used by the Open Graph and Twitter tags |
 
 pynput, which reads and moves the mouse, is licensed under the LGPL-3.0 and is bundled in the downloadable
 app.
