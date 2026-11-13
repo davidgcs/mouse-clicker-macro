@@ -25,19 +25,51 @@ class TooltipTests(unittest.TestCase):
         patcher = mock.patch.object(tk.Toplevel, "deiconify")
         self.deiconify = patcher.start()
         self.addCleanup(patcher.stop)
-        self.tip = Tooltip(self.button, "Show in Finder")
+        with mock.patch.object(self.button, "bind", wraps=self.button.bind) as bind:
+            self.tip = Tooltip(self.button, "Show in Finder")
+        self.bind_calls = bind.call_args_list
+        self.bound = {call.args[0]: call.args[1] for call in self.bind_calls}
 
     def hints(self):
         return [child for child in self.button.winfo_children() if isinstance(child, tk.Toplevel)]
 
+    def fire(self, sequence: str) -> None:
+        """Do what Tk does when the sequence happens on the button: run what the tooltip bound to it.
+
+        With Tk 9 on macOS a synthetic event never reaches a widget that was not mapped yet, and a test should not put
+        a window on the screen, so the callbacks are called directly.
+        """
+        self.bound[sequence](tk.Event())
+
+    def test_the_pointer_is_wired_to_the_hint(self):
+        self.assertEqual(
+            self.bound,
+            {
+                "<Enter>": self.tip._schedule,
+                "<Leave>": self.tip.hide,
+                "<ButtonPress>": self.tip.hide,
+                "<Destroy>": self.tip.hide,
+            },
+        )
+
+    def test_bindings_the_widget_already_had_keep_working(self):
+        self.assertEqual({call.kwargs.get("add") for call in self.bind_calls}, {"+"})
+        button = ttk.Button(self.root, text="Other")
+        button.bind("<Enter>", lambda event: None)
+        before = button.bind("<Enter>")
+        Tooltip(button, "Hint")
+        after = button.bind("<Enter>")
+        self.assertTrue(after.startswith(before))
+        self.assertGreater(len(after), len(before))
+
     def test_nothing_shows_until_the_pointer_has_rested_on_the_widget(self):
-        self.button.event_generate("<Enter>")
+        self.fire("<Enter>")
         self.assertEqual(self.hints(), [])
         self.assertIsNotNone(self.tip._job)
 
     def test_the_hint_waits_for_the_hover_delay(self):
         with mock.patch.object(self.button, "after", return_value="job") as after:
-            self.button.event_generate("<Enter>")
+            self.fire("<Enter>")
         after.assert_called_once_with(tooltip.HOVER_MS, self.tip._show)
 
     def test_the_hint_shows_its_text(self):
@@ -85,33 +117,34 @@ class TooltipTests(unittest.TestCase):
 
     def test_leaving_the_widget_hides_the_hint(self):
         self.tip._show()
-        self.button.event_generate("<Leave>")
+        self.fire("<Leave>")
         self.assertEqual(self.hints(), [])
         self.assertIsNone(self.tip._window)
 
     def test_leaving_before_the_delay_cancels_it(self):
         with mock.patch.object(self.button, "after", return_value="job"):
-            self.button.event_generate("<Enter>")
+            self.fire("<Enter>")
         with mock.patch.object(self.button, "after_cancel") as after_cancel:
-            self.button.event_generate("<Leave>")
+            self.fire("<Leave>")
         after_cancel.assert_called_once_with("job")
         self.assertIsNone(self.tip._job)
 
     def test_clicking_the_widget_hides_the_hint(self):
         self.tip._show()
-        self.button.event_generate("<ButtonPress-1>")
+        self.fire("<ButtonPress>")
         self.assertEqual(self.hints(), [])
 
     def test_clicking_the_widget_cancels_a_hint_that_is_still_to_come(self):
-        self.button.event_generate("<Enter>")
-        self.button.event_generate("<ButtonPress-1>")
+        self.fire("<Enter>")
+        self.assertIsNotNone(self.tip._job)
+        self.fire("<ButtonPress>")
         self.assertIsNone(self.tip._job)
 
     def test_entering_again_does_not_leave_two_timers(self):
         with mock.patch.object(self.button, "after", side_effect=["first", "second"]):
             with mock.patch.object(self.button, "after_cancel") as after_cancel:
-                self.button.event_generate("<Enter>")
-                self.button.event_generate("<Enter>")
+                self.fire("<Enter>")
+                self.fire("<Enter>")
         after_cancel.assert_called_once_with("first")
 
     def test_hiding_when_there_is_nothing_to_hide_is_fine(self):
@@ -120,19 +153,16 @@ class TooltipTests(unittest.TestCase):
 
     def test_destroying_the_widget_takes_the_hint_with_it(self):
         self.tip._show()
-        self.button.event_generate("<Enter>")
         self.button.destroy()
         self.assertIsNone(self.tip._window)
-        self.assertIsNone(self.tip._job)
 
-    def test_bindings_the_widget_already_had_keep_working(self):
-        seen = []
-        button = ttk.Button(self.root, text="Other")
-        button.bind("<Enter>", lambda event: seen.append("mine"))
-        tip = Tooltip(button, "Hint")
-        button.event_generate("<Enter>")
-        self.assertEqual(seen, ["mine"])
-        self.assertIsNotNone(tip._job)
+    def test_destroying_the_widget_cancels_a_hint_that_is_still_to_come(self):
+        with mock.patch.object(self.button, "after", return_value="job"):
+            self.fire("<Enter>")
+        with mock.patch.object(self.button, "after_cancel") as after_cancel:
+            self.button.destroy()
+        after_cancel.assert_called_once_with("job")
+        self.assertIsNone(self.tip._job)
 
 
 if __name__ == "__main__":
