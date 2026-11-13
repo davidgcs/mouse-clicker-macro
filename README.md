@@ -167,6 +167,7 @@ release. The download page always links to the latest release. The page itself i
 | `release/smoke_test.py` | Checks that a built app starts |
 | `.github/workflows/build.yml` | Tests, builds and releases on GitHub Actions |
 | `docs/index.html` | Download page |
+| `docs/github-brand.css` | Creator banner styling adapted from [Safe Layer](https://davidgcs.github.io/safelayer/) |
 
 pynput, which reads and moves the mouse, is licensed under the LGPL-3.0 and is bundled in the downloadable
 app.
