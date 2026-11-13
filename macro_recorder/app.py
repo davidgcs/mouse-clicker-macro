@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import contextlib
+import importlib
 import math
+import platform
 import queue
+import sys
 import threading
 import time
 import tkinter as tk
+import traceback
 from enum import Enum, auto
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -18,6 +23,7 @@ from .player import Player, parse_loop_settings
 from .recorder import Recorder
 from .recording import Recording, RecordingError, new_macro_path
 
+APP_NAME = "Mouse Macro Recorder"
 COUNTDOWN_SECONDS = 3
 POLL_MS = 50
 MACROS_DIR = Path.home() / "MouseMacros"
@@ -25,6 +31,11 @@ CONTENT_WIDTH = 420  # pixels
 TITLE_BAR_HEIGHT = 40  # pixels above the window content that may belong to its title bar
 LOADED_HINT = "Press Repeat to replay it, or Loop to repeat it."
 ACTION_NAMES = {"record": "starting a recording", "stop": "stopping"}
+SELF_TEST_FLAG = "--self-test"
+SELF_TEST_MS = 1000  # how long the self-test keeps the window open
+# The app imports these only when it needs them and carries on without them, so a packaged
+# build that lacked them would still start. The self-test makes sure they are there.
+SELF_TEST_IMPORTS = {"darwin": ("Foundation", "Quartz")}
 
 
 class State(Enum):
@@ -44,6 +55,13 @@ def describe_runs(done: int, times: int | None) -> str:
         return ""
     total = f" of {times}" if times else ""
     return f"{done}{total} run{'' if (times or done) == 1 else 's'} completed"
+
+
+def permission_holder() -> str:
+    """Who macOS grants the mouse permissions to: the packaged app itself, or whatever started Python."""
+    if getattr(sys, "frozen", False):
+        return APP_NAME
+    return "the app that runs this program (Terminal, PyCharm...)"
 
 
 class App:
@@ -70,6 +88,7 @@ class App:
         self._newest_status: tuple[str, str] | None = None
         self.worker: threading.Thread | None = None
         self.closed = False
+        self._poll_job: str | None = None
         self.countdown_end = 0.0
         self.record_start = 0.0
 
@@ -84,7 +103,7 @@ class App:
 
     def _build_ui(self) -> None:
         root = self.root
-        root.title("Mouse Macro Recorder")
+        root.title(APP_NAME)
         root.resizable(False, False)
         root.protocol("WM_DELETE_WINDOW", self.close)
         root.createcommand("tk::mac::Quit", self.close)  # Cmd+Q on macOS
@@ -170,8 +189,8 @@ class App:
         banner = ttk.Frame(parent)
         banner.pack(fill="x", pady=(0, 10))
         text = (
-            f"macOS is blocking mouse access. Allow {' and '.join(missing)} for the app that runs this "
-            "program (Terminal, PyCharm...) in System Settings > Privacy & Security, then restart it."
+            f"macOS is blocking mouse access. Allow {' and '.join(missing)} for {permission_holder()} "
+            "in System Settings > Privacy & Security, then restart it."
         )
         ttk.Label(banner, text=text, foreground="#c62828", wraplength=CONTENT_WIDTH, justify="left").pack(anchor="w")
         ttk.Button(
@@ -260,7 +279,7 @@ class App:
             self._tick()
         finally:
             if not self.closed:
-                self.root.after(POLL_MS, self._poll)
+                self._poll_job = self.root.after(POLL_MS, self._poll)
 
     def _drain(self) -> None:
         """Handles the messages that are waiting now; any that arrive meanwhile wait for the next poll.
@@ -379,7 +398,10 @@ class App:
             self._set_state(State.IDLE)
             message = "No mouse movement or clicks were recorded."
             if permissions.missing_permissions():
-                message += "\n\nOn macOS, allow Input Monitoring for this app in System Settings > Privacy & Security."
+                message += (
+                    f"\n\nAllow Input Monitoring for {permission_holder()} in System Settings > Privacy & Security, "
+                    "then restart it."
+                )
             messagebox.showwarning("Nothing recorded", message, parent=self.root)
             return
         self.macro, self.macro_path = macro, None
@@ -483,10 +505,16 @@ class App:
         self.recorder.stop()
         if self.worker is not None:
             self.worker.join(timeout=1.0)  # lets a macro release any button it is holding
+        if self._poll_job is not None:
+            self.root.after_cancel(self._poll_job)  # it would fire into a window that is gone
         self.root.destroy()
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> int:
+    """Runs the app and returns its exit code. `--self-test [report]` checks a packaged build instead."""
+    args = sys.argv[1:] if argv is None else argv
+    if args[:1] == [SELF_TEST_FLAG]:
+        return self_test(Path(args[1]) if len(args) > 1 else None)
     permissions.prevent_app_nap()
     root = tk.Tk()
     App(root)
@@ -495,3 +523,41 @@ def main() -> None:
     root.attributes("-topmost", True)
     root.after(300, lambda: root.attributes("-topmost", False))
     root.mainloop()
+    return 0
+
+
+def self_test(report: Path | None = None) -> int:
+    """Opens the window and closes it again, to prove that a packaged build has all it needs.
+
+    Returns the exit code, 0 when all went well. The outcome is also written to `report`,
+    because a windowed Windows build has nowhere to print.
+    """
+    problems: list[str] = []
+    outcome = ""
+    root = None
+    try:
+        for name in SELF_TEST_IMPORTS.get(sys.platform, ()):
+            importlib.import_module(name)
+        permissions.prevent_app_nap()
+        root = tk.Tk()
+        root.report_callback_exception = lambda *error: problems.append("".join(traceback.format_exception(*error)))
+        app = App(root)
+        outcome = f"Python {platform.python_version()} on {platform.machine()}, Tk {root.tk.call('info', 'patchlevel')}"
+
+        def finish() -> None:
+            try:
+                app.close()
+            finally:
+                with contextlib.suppress(tk.TclError):
+                    root.destroy()  # also when closing went wrong, so that the self-test cannot hang
+
+        root.after(SELF_TEST_MS, finish)
+        root.mainloop()
+    except Exception:
+        problems.append(traceback.format_exc())
+        if root is not None:
+            with contextlib.suppress(tk.TclError):
+                root.destroy()
+    if report is not None:
+        report.write_text("".join(problems) if problems else f"ok: {outcome}\n", encoding="utf-8")
+    return 1 if problems else 0

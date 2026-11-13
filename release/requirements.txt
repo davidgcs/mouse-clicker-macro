@@ -1,0 +1,3 @@
+# Everything needed to build the downloadable app (see "Building the app" in the README).
+-r ../requirements.txt
+pyinstaller==6.22.3

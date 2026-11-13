@@ -1,0 +1,129 @@
+# Tests the app, builds the downloadable versions for Windows and macOS and checks that they start.
+# Pushing a tag such as v1.2.0 also publishes them as a GitHub release, which the download page links to.
+name: Build
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  # python.org's macOS Python is universal2, so the app it builds runs on Apple silicon and Intel Macs.
+  MAC_PYTHON: "3.14.10"
+  MAC_PYTHON_SHA256: 286c7018aa2730f6747ca433dccdc2b31be45f078a9ea0ffa44d5f06368fd2d7
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    # A pull request from a branch of this repository was already built when the branch was pushed.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows
+            os: windows-latest
+          - name: macOS
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        if: runner.os == 'Windows'
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+
+      - name: Set up Python
+        if: runner.os == 'macOS'
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/python.pkg" "https://www.python.org/ftp/python/$MAC_PYTHON/python-$MAC_PYTHON-macos11.pkg"
+          echo "$MAC_PYTHON_SHA256  $RUNNER_TEMP/python.pkg" | shasum -a 256 -c -
+          sudo installer -pkg "$RUNNER_TEMP/python.pkg" -target /
+          "/Library/Frameworks/Python.framework/Versions/${MAC_PYTHON%.*}/bin/python3" -m venv "$RUNNER_TEMP/venv"
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+
+      - name: Install the dependencies
+        run: python -m pip install -r release/requirements.txt
+
+      - name: Run the tests
+        run: python -m unittest discover -v
+
+      - name: Build the app
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then export APP_VERSION="${GITHUB_REF_NAME#v}"; fi
+          python -m PyInstaller --noconfirm --clean release/MouseMacroRecorder.spec
+
+      - name: Check that the app starts
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: python release/smoke_test.py dist\MouseMacroRecorder.exe
+
+      - name: Check that the app starts on Apple silicon and Intel Macs
+        if: runner.os == 'macOS'
+        run: |
+          app="dist/Mouse Macro Recorder.app"
+          codesign --verify --deep --strict "$app"
+          for arch in arm64 x86_64; do lipo "$app/Contents/MacOS/MouseMacroRecorder" -verify_arch "$arch"; done
+          python release/smoke_test.py "$app/Contents/MacOS/MouseMacroRecorder"
+          if arch -x86_64 /usr/bin/true 2> /dev/null; then
+            python release/smoke_test.py arch -x86_64 "$app/Contents/MacOS/MouseMacroRecorder"
+          else
+            echo "::warning::Rosetta is not installed on this runner, so the Intel half of the app was not tried."
+          fi
+
+      - name: Package
+        shell: bash
+        run: |
+          mkdir upload
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            cp dist/MouseMacroRecorder.exe upload/MouseMacroRecorder-Windows.exe
+          else
+            ditto -c -k --sequesterRsrc --keepParent "dist/Mouse Macro Recorder.app" upload/MouseMacroRecorder-macOS.zip
+          fi
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: MouseMacroRecorder-${{ matrix.name }}
+          path: upload/
+          if-no-files-found: error
+
+  release:
+    name: Publish the release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: assets
+          merge-multiple: true
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          NOTES: >-
+            Download **MouseMacroRecorder-Windows.exe** for Windows or **MouseMacroRecorder-macOS.zip** for a Mac.
+            The first time you open it, follow the steps on https://davidgcs.github.io/mouse-clicker-macro/
+        run: |
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" assets/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" assets/* --title "Mouse Macro Recorder $GITHUB_REF_NAME" \
+              --notes "$NOTES" --generate-notes
+          fi

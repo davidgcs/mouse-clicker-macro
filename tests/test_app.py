@@ -2,6 +2,7 @@
 fake recorder, player and shortcuts, and mocked dialogs. The event loop is never run; tests call
 the same methods the loop would."""
 
+import sys
 import tempfile
 import time
 import tkinter as tk
@@ -119,6 +120,9 @@ class AppTestCase(unittest.TestCase):
 
     @staticmethod
     def destroy(root):
+        # Timers left behind would fire later, inside the event loop of another test's window.
+        for job in root.tk.splitlist(root.tk.call("after", "info")):
+            root.after_cancel(job)
         try:
             root.update_idletasks()  # Tk 8.5 complains about idle callbacks still pending when it is destroyed
             root.destroy()
@@ -235,10 +239,123 @@ class StartupTests(AppTestCase):
         with mock.patch.object(app_module.tk, "Tk", return_value=root), mock.patch.object(
             app_module, "App"
         ) as app_class, mock.patch.object(app_module.permissions, "prevent_app_nap") as prevent_nap:
-            app_module.main()
+            self.assertEqual(app_module.main([]), 0)
         prevent_nap.assert_called_once_with()
         app_class.assert_called_once_with(root)
         root.mainloop.assert_called_once_with()
+
+
+class SelfTestTests(AppTestCase):
+    """`--self-test` is how the release build proves that a packaged app starts."""
+
+    def setUp(self):
+        super().setUp()
+        try:
+            tk.Tk().destroy()
+        except tk.TclError as exc:
+            self.skipTest(f"Tk is not available here: {exc}")
+        self.report = self.tmp / "report.txt"
+        self.patch(app_module, "SELF_TEST_MS", new=10)
+        self.prevent_nap = self.patch(app_module.permissions, "prevent_app_nap")
+        self.windows = []
+        self.real_tk, real_app = tk.Tk, App
+
+        def hidden_root():
+            root = self.real_tk()
+            root.withdraw()
+            self.addCleanup(self.destroy, root)
+            return root
+
+        def app_with_fakes(root):
+            window = real_app(
+                root,
+                hotkeys_factory=FakeHotkeys,
+                recorder=self.recorder,
+                player=self.player,
+                macros_dir=self.macros_dir,
+            )
+            self.windows.append(window)
+            return window
+
+        self.patch(app_module.tk, "Tk", side_effect=hidden_root)
+        self.app_class = self.patch(app_module, "App", side_effect=app_with_fakes)
+
+    def outcome(self):
+        return self.report.read_text(encoding="utf-8")
+
+    def test_it_opens_the_window_and_closes_it_again(self):
+        self.assertEqual(app_module.self_test(self.report), 0)
+        (window,) = self.windows
+        self.assertTrue(window.closed)
+        self.assertEqual(window.hotkeys.started, 1)
+        self.assertEqual(window.hotkeys.stopped, 1)
+        self.prevent_nap.assert_called_once_with()
+        self.assertRegex(self.outcome(), r"^ok: Python \S+ on \S+, Tk \d")
+
+    def test_it_fails_when_the_window_cannot_be_built(self):
+        self.app_class.side_effect = RuntimeError("no window today")
+        self.assertEqual(app_module.self_test(self.report), 1)
+        self.assertIn("RuntimeError: no window today", self.outcome())
+
+    def test_it_fails_when_something_goes_wrong_while_the_window_is_open(self):
+        build = self.app_class.side_effect
+
+        def app_that_fails_later(root):
+            root.after(0, lambda: 1 / 0)
+            return build(root)
+
+        self.app_class.side_effect = app_that_fails_later
+        self.assertEqual(app_module.self_test(self.report), 1)
+        self.assertIn("ZeroDivisionError", self.outcome())
+        self.assertTrue(self.windows[0].closed)
+
+    def test_it_fails_rather_than_hangs_when_the_window_does_not_close(self):
+        build = self.app_class.side_effect
+        rescued = []
+
+        def app_that_cannot_close(root):
+            window = build(root)
+            window.close = mock.Mock(side_effect=RuntimeError("stuck open"))
+            root.after(5000, lambda: (rescued.append("the self-test hung"), root.destroy()))
+            return window
+
+        self.app_class.side_effect = app_that_cannot_close
+        self.assertEqual(app_module.self_test(self.report), 1)
+        self.assertEqual(rescued, [])
+        self.assertIn("RuntimeError: stuck open", self.outcome())
+
+    def test_it_fails_when_a_module_the_app_can_do_without_is_missing(self):
+        self.patch(app_module, "SELF_TEST_IMPORTS", new={sys.platform: ("no_such_module_for_the_self_test",)})
+        self.assertEqual(app_module.self_test(self.report), 1)
+        self.assertIn("No module named 'no_such_module_for_the_self_test'", self.outcome())
+        self.app_class.assert_not_called()
+
+    def test_the_report_is_optional(self):
+        self.assertEqual(app_module.self_test(), 0)
+        self.assertFalse(self.report.exists())
+
+    def test_main_runs_it_when_asked_and_returns_its_exit_code(self):
+        with mock.patch.object(app_module, "self_test", return_value=1) as self_test, mock.patch.object(
+            self.real_tk, "mainloop"
+        ):
+            self.assertEqual(app_module.main(["--self-test", str(self.report)]), 1)
+            self.assertEqual(app_module.main(["--self-test"]), 1)
+        self.assertEqual(self_test.call_args_list, [mock.call(self.report), mock.call(None)])
+        self.app_class.assert_not_called()
+
+    def test_main_reads_the_command_line_by_default(self):
+        with mock.patch.object(app_module, "self_test", return_value=0) as self_test, mock.patch.object(
+            app_module.sys, "argv", ["MouseMacroRecorder", "--self-test", str(self.report)]
+        ), mock.patch.object(self.real_tk, "mainloop"):
+            self.assertEqual(app_module.main(), 0)
+        self_test.assert_called_once_with(self.report)
+
+    def test_other_arguments_start_the_app_as_usual(self):
+        # macOS used to pass a process serial number to apps opened from the Finder.
+        with mock.patch.object(app_module, "self_test") as self_test, mock.patch.object(self.real_tk, "mainloop"):
+            self.assertEqual(app_module.main(["-psn_0_12345"]), 0)
+        self_test.assert_not_called()
+        self.app_class.assert_called_once()
 
 
 class RecordingTests(AppTestCase):
@@ -391,7 +508,7 @@ class RecordingTests(AppTestCase):
         self.missing_permissions.return_value = ["Input Monitoring"]
         self.press("record")
         self.press("stop")
-        self.assertIn("Input Monitoring", self.messagebox.showwarning.call_args.args[1])
+        self.assertIn("Allow Input Monitoring for the app that runs", self.messagebox.showwarning.call_args.args[1])
 
     def test_an_empty_recording_keeps_the_previous_macro(self):
         self.load_macro()
@@ -856,6 +973,16 @@ class CloseTests(AppTestCase):
         self.assertDestroyed()
         self.messagebox.askyesno.assert_not_called()
 
+    def test_closing_leaves_no_poll_waiting_to_fire(self):
+        root = self.app.root
+
+        def waiting():
+            return root.tk.splitlist(root.tk.call("after", "info"))
+
+        self.assertIn(self.app._poll_job, waiting())
+        self.app.close()
+        self.assertEqual(waiting(), ())
+
     def test_closing_while_recording_asks_first(self):
         self.press("record")
         self.messagebox.askyesno.return_value = False
@@ -909,9 +1036,16 @@ class PermissionBannerTests(AppTestCase):
         self.missing_permissions.return_value = ["Input Monitoring", "Accessibility"]
         button = find_button(self.app.root, "Open System Settings")
         self.assertIsNotNone(button)
-        self.assertTrue(any("Input Monitoring and Accessibility" in text for text in self.labels()))
+        self.assertTrue(any("Input Monitoring and Accessibility for the app that runs" in t for t in self.labels()))
         button.invoke()
         self.open_settings.assert_called_once_with("Input Monitoring")
+
+    def test_the_packaged_app_asks_for_the_permissions_itself(self):
+        self.missing_permissions.return_value = ["Accessibility"]
+        with mock.patch.object(app_module.sys, "frozen", True, create=True):
+            self.launch()
+        self.assertTrue(any("Allow Accessibility for Mouse Macro Recorder in" in t for t in self.labels()))
+        self.assertFalse(any("Terminal" in text for text in self.labels()))
 
 
 class LayoutTests(AppTestCase):

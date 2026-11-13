@@ -3,6 +3,16 @@
 A small desktop app for macOS and Windows that records your mouse movements, clicks and scrolling as a
 macro, saves it to a file, and replays it once or in a loop.
 
+## Download
+
+Get the app for Windows or Mac from the **[download page](https://davidgcs.github.io/mouse-clicker-macro/)**.
+There is nothing else to install, and the page explains the first start on each system. Every version is
+also on the [releases page](https://github.com/davidgcs/mouse-clicker-macro/releases). You can also
+[run it from the source code](#run-from-source) instead.
+
+It doesn't run in a web browser, because browsers don't let web pages watch or move the mouse outside their
+own tab.
+
 ## Features
 
 - **Record** with the Record button (3, 2, 1 countdown) or with a global shortcut (**F1** by default).
@@ -12,7 +22,7 @@ macro, saves it to a file, and replays it once or in a loop.
   between runs (5 seconds by default).
 - Both shortcuts can be changed in the app, and the choice is remembered.
 
-## Install
+## Run from source
 
 You need Python 3.9 or newer with Tk (the python.org installers include it; with Homebrew run
 `brew install python-tk`).
@@ -21,15 +31,10 @@ You need Python 3.9 or newer with Tk (the python.org installers include it; with
 python3 -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
+python main.py
 ```
 
 If the install fails on macOS with an old Python, run `python -m pip install --upgrade pip` first.
-
-## Run
-
-```
-python main.py
-```
 
 ## Using it
 
@@ -56,20 +61,25 @@ Shortcuts work while other apps are in front, and the key is still passed on to 
 
 ## Permissions and platform notes
 
-**macOS.** The system blocks mouse access until you allow the app you start Python from (Terminal,
-iTerm, PyCharm, VS Code...) in **System Settings > Privacy & Security**:
+**macOS.** The system blocks mouse access until you allow it in **System Settings > Privacy & Security**:
+allow **Mouse Macro Recorder** if you use the downloaded app, or the app you start Python from (Terminal,
+iTerm, PyCharm, VS Code...) if you run it from source. It needs:
 
 - **Input Monitoring** to record and for the shortcuts,
 - **Accessibility** to replay.
 
-Quit and reopen that app after allowing it. This program shows a red notice with a shortcut to the
-settings while a permission is missing. On Mac laptops F1 and F2 are media keys unless you hold **fn**,
-turn on "Use F1, F2, etc. keys as standard function keys" in System Settings > Keyboard, or choose other
-shortcuts.
+Quit and reopen the app after allowing it. This program shows a red notice with a shortcut to the
+settings while a permission is missing. The downloaded app isn't notarized by Apple, so the first time
+macOS refuses to open it: click **Open Anyway** in System Settings > Privacy & Security. After you install
+a newer version, remove Mouse Macro Recorder from both permission lists and allow it again. On Mac
+laptops F1 and F2 are media keys unless you hold **fn**, turn on "Use F1, F2, etc. keys as standard
+function keys" in System Settings > Keyboard, or choose other shortcuts.
 
-**Windows.** F1 usually opens Help in the app in front, because shortcuts are not swallowed; pick another
-key if that bothers you. Windows apps running as administrator ignore input from a normal program, so run
-this one as administrator to record or replay on them.
+**Windows.** The downloaded app isn't signed with a paid certificate, so the first time Windows says
+"Windows protected your PC": click **More info**, then **Run anyway**. F1 usually opens Help in the app in
+front, because shortcuts are not swallowed; pick another key if that bothers you. Windows apps running as
+administrator ignore input from a normal program, so run this one as administrator to record or replay on
+them.
 
 ## Macro files
 
@@ -112,13 +122,51 @@ python -m unittest discover -v
 The tests use fake mouse and keyboard devices, so they never move or click the real pointer. The window
 tests need Tk and a display, and are skipped when Tk is unavailable.
 
+### Building the app
+
+PyInstaller turns the program into a single `.exe` on Windows and an `.app` on macOS. It can only build for
+the system it runs on. On macOS, use Python from python.org, which is universal2, so that the app runs on
+both Apple silicon and Intel Macs.
+
+```
+pip install -r release/requirements.txt
+pyinstaller --noconfirm --clean release/MouseMacroRecorder.spec
+python release/smoke_test.py dist\MouseMacroRecorder.exe                                         # Windows
+python release/smoke_test.py "dist/Mouse Macro Recorder.app/Contents/MacOS/MouseMacroRecorder"   # macOS
+```
+
+`smoke_test.py` starts the built app in self-test mode, which opens the window for a second and closes it
+again, and fails if the app reports a problem or doesn't finish in time.
+
+### Releasing
+
+GitHub Actions ([`build.yml`](.github/workflows/build.yml)) runs the tests, then builds and smoke-tests the
+app on Windows and macOS for every push. The builds are attached to each run. To publish a version, push a
+tag:
+
+```
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+The workflow then attaches `MouseMacroRecorder-Windows.exe` and `MouseMacroRecorder-macOS.zip` to a GitHub
+release. The download page always links to the latest release. The page itself is
+[`docs/index.html`](docs/index.html), published with GitHub Pages from the `docs` folder of `main`.
+
 | File | Purpose |
 | --- | --- |
 | `main.py` | Starts the app |
-| `macro_recorder/app.py` | Window and the record, play and shortcut state machine |
+| `macro_recorder/app.py` | Window, the record, play and shortcut state machine, and the self-test |
 | `macro_recorder/recording.py` | Macro model and file format |
 | `macro_recorder/recorder.py` | Captures mouse events |
 | `macro_recorder/player.py` | Replays macros and runs loops |
 | `macro_recorder/hotkeys.py` | Global shortcuts |
 | `macro_recorder/settings.py` | Saved shortcuts |
 | `macro_recorder/permissions.py` | macOS permission checks |
+| `release/MouseMacroRecorder.spec` | PyInstaller recipe for the Windows and macOS app |
+| `release/smoke_test.py` | Checks that a built app starts |
+| `.github/workflows/build.yml` | Tests, builds and releases on GitHub Actions |
+| `docs/index.html` | Download page |
+
+pynput, which reads and moves the mouse, is licensed under the LGPL-3.0 and is bundled in the downloadable
+app.
