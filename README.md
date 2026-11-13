@@ -18,9 +18,13 @@ own tab.
 - **Record** with the Record button (3, 2, 1 countdown) or with a global shortcut (**F1** by default).
 - **Stop** with the Stop button or a shortcut (**F2** by default). The macro is saved automatically.
 - **Repeat** the macro once, **import** a macro file saved earlier, or **loop** it.
+- **Save as…** keeps the macro under a name and in a folder of your choice, and the folder button next to its
+  path shows the file in Finder or File Explorer.
 - A loop runs a set number of times (leave it empty to loop forever) with a pause in seconds or minutes
   between runs (5 seconds by default).
-- Both shortcuts can be changed in the app, and the choice is remembered.
+- **Start or resume** the loop with a shortcut (**F3** by default) and **pause** it with another (**F4** by
+  default).
+- All four shortcuts can be changed in the app, and the choice is remembered.
 
 ## Run from source
 
@@ -48,16 +52,31 @@ the button, the final click on the Stop button is left out of the macro.
 
 **Import.** Click **Import…** and pick a macro file saved earlier.
 
-**Loop.** Set how many times to run it (empty means forever) and how long to wait between runs, in
-seconds or minutes, then click **Loop**. The first run starts immediately and nothing waits after the last
-one. For example, 10 times with 25 seconds runs the macro, waits 25 seconds, runs it again, and so on for
-10 runs in total (9 waits). While a loop is running, the window shows the current run and the time left
-until the next one.
+**Save as.** Click **Save as…** to keep the loaded macro under a name and in a folder of your choice. `.json`
+is added if you leave out the extension. The macro in use becomes that file; the file it came from stays as
+it was.
 
-**Stop playback.** Click **Stop** or press the stop shortcut at any time, even during a wait.
+**Show the file.** Click the folder icon next to the path of the macro to open its folder in Finder (macOS) or
+File Explorer (Windows) with the file selected. The icon is greyed out while the macro isn't in a file yet,
+and during playback, because the new window would receive the clicks of the macro.
+
+**Loop.** Set how many times to run it (empty means forever) and how long to wait between runs, in
+seconds or minutes, then click **Loop** or press the loop shortcut (**F3** by default). The first run starts
+immediately and nothing waits after the last one. For example, 10 times with 25 seconds runs the macro,
+waits 25 seconds, runs it again, and so on for 10 runs in total (9 waits). While a loop is running, the
+window shows the current run and the time left until the next one.
+
+**Pause and resume.** Click **Pause** or press the pause shortcut (**F4** by default) to freeze a loop, or a
+single replay, where it is. The Loop button becomes **Resume**: click it or press the loop shortcut
+(**F3** by default) to carry on from the same point. The macro keeps its timing, and the time spent paused is
+not counted in the wait between runs. If the macro is holding a mouse button down when you pause, it pauses
+as soon as the macro lets go of the button, so you never get the mouse back with a button stuck down.
+
+**Stop playback.** Click **Stop** or press the stop shortcut at any time, even during a wait or a pause.
 
 **Change a shortcut.** Click **Change…** next to it and press the new key (a single key, no combinations).
-Shortcuts work while other apps are in front, and the key is still passed on to that app.
+Each action needs its own key. Shortcuts work while other apps are in front, and the key is still passed on
+to that app.
 
 ## Permissions and platform notes
 
@@ -72,14 +91,14 @@ Quit and reopen the app after allowing it. This program shows a red notice with 
 settings while a permission is missing. The downloaded app isn't notarized by Apple, so the first time
 macOS refuses to open it: click **Open Anyway** in System Settings > Privacy & Security. After you install
 a newer version, remove Mouse Macro Recorder from both permission lists and allow it again. On Mac
-laptops F1 and F2 are media keys unless you hold **fn**, turn on "Use F1, F2, etc. keys as standard
-function keys" in System Settings > Keyboard, or choose other shortcuts.
+laptops F1 to F4 are media keys (brightness, Mission Control...) unless you hold **fn**, turn on "Use F1,
+F2, etc. keys as standard function keys" in System Settings > Keyboard, or choose other shortcuts.
 
 **Windows.** The downloaded app isn't signed with a paid certificate, so the first time Windows says
 "Windows protected your PC": click **More info**, then **Run anyway**. F1 usually opens Help in the app in
-front, because shortcuts are not swallowed; pick another key if that bothers you. Windows apps running as
-administrator ignore input from a normal program, so run this one as administrator to record or replay on
-them.
+front, and F3 and F4 do something in many apps too, because shortcuts are not swallowed; pick other keys if
+that bothers you. Windows apps running as administrator ignore input from a normal program, so run this one
+as administrator to record or replay on them.
 
 ## Macro files
 
@@ -102,8 +121,10 @@ Macros are plain JSON, with one event per line and times in seconds from the fir
 If you edit a file by hand, keep times to at most 1,000,000 seconds and positions and scroll amounts to
 within 1,000,000 of zero; the app refuses to import a macro that goes beyond that.
 
-The shortcuts are saved in `settings.json` in `~/Library/Application Support/MouseMacroRecorder` on
-macOS, or `%APPDATA%\MouseMacroRecorder` on Windows.
+The four shortcuts are saved in `settings.json` in `~/Library/Application Support/MouseMacroRecorder` on
+macOS, or `%APPDATA%\MouseMacroRecorder` on Windows. A file from an older version, which only has the record
+and stop shortcuts, gets F3 and F4 for the new ones (or the first function keys that are free, if you already
+use those).
 
 ## Good to know
 
@@ -159,9 +180,12 @@ release. The download page always links to the latest release. The page itself i
 | `macro_recorder/app.py` | Window, the record, play and shortcut state machine, and the self-test |
 | `macro_recorder/recording.py` | Macro model and file format |
 | `macro_recorder/recorder.py` | Captures mouse events |
-| `macro_recorder/player.py` | Replays macros and runs loops |
+| `macro_recorder/player.py` | Replays macros, runs loops and pauses them |
 | `macro_recorder/hotkeys.py` | Global shortcuts |
 | `macro_recorder/settings.py` | Saved shortcuts |
+| `macro_recorder/filemanager.py` | Shows a file in Finder or File Explorer |
+| `macro_recorder/icons.py` | Draws the folder icon |
+| `macro_recorder/tooltip.py` | The hint that appears over the folder icon |
 | `macro_recorder/permissions.py` | macOS permission checks |
 | `release/MouseMacroRecorder.spec` | PyInstaller recipe for the Windows and macOS app |
 | `release/smoke_test.py` | Checks that a built app starts |

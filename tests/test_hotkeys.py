@@ -233,8 +233,8 @@ class SettingsTests(unittest.TestCase):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(text, encoding="utf-8")
 
-    def test_defaults_are_f1_and_f2(self):
-        self.assertEqual(settings.DEFAULT_HOTKEYS, {"record": "f1", "stop": "f2"})
+    def test_defaults_are_f1_to_f4(self):
+        self.assertEqual(settings.DEFAULT_HOTKEYS, {"record": "f1", "stop": "f2", "loop": "f3", "pause": "f4"})
 
     def test_a_missing_file_gives_the_defaults(self):
         self.assertEqual(settings.load_hotkeys(self.path), settings.DEFAULT_HOTKEYS)
@@ -244,9 +244,10 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.load_hotkeys(self.path)["record"], "f1")
 
     def test_round_trip_creates_missing_directories(self):
-        settings.save_hotkeys({"record": "f5", "stop": "esc"}, self.path)
-        self.assertEqual(settings.load_hotkeys(self.path), {"record": "f5", "stop": "esc"})
-        self.assertEqual(json.loads(self.path.read_text()), {"hotkeys": {"record": "f5", "stop": "esc"}})
+        keys = {"record": "f5", "stop": "esc", "loop": "f7", "pause": "f8"}
+        settings.save_hotkeys(keys, self.path)
+        self.assertEqual(settings.load_hotkeys(self.path), keys)
+        self.assertEqual(json.loads(self.path.read_text()), {"hotkeys": keys})
 
     def test_unusable_files_give_the_defaults(self):
         bad = {
@@ -256,10 +257,15 @@ class SettingsTests(unittest.TestCase):
             "null": "null",
             "no hotkeys": "{}",
             "hotkeys not an object": '{"hotkeys": []}',
-            "missing action": '{"hotkeys": {"record": "f5"}}',
+            "missing stop": '{"hotkeys": {"record": "f5"}}',
+            "missing record": '{"hotkeys": {"stop": "f6"}}',
             "invalid name": '{"hotkeys": {"record": "f5", "stop": "nonsense"}}',
             "not a string": '{"hotkeys": {"record": "f5", "stop": 3}}',
             "same key twice": '{"hotkeys": {"record": "f5", "stop": "f5"}}',
+            "invalid loop name": '{"hotkeys": {"record": "f5", "stop": "f6", "loop": "nonsense"}}',
+            "loop not a string": '{"hotkeys": {"record": "f5", "stop": "f6", "loop": null}}',
+            "loop and pause the same": '{"hotkeys": {"record": "f5", "stop": "f6", "loop": "f7", "pause": "f7"}}',
+            "loop is the record key": '{"hotkeys": {"record": "f5", "stop": "f6", "loop": "f5"}}',
             "too deep": "[" * 100000,
         }
         for label, text in bad.items():
@@ -278,7 +284,32 @@ class SettingsTests(unittest.TestCase):
 
     def test_unknown_entries_are_ignored(self):
         self.write('{"hotkeys": {"record": "f5", "stop": "f6", "other": "x"}, "future": 1}')
-        self.assertEqual(settings.load_hotkeys(self.path), {"record": "f5", "stop": "f6"})
+        self.assertEqual(settings.load_hotkeys(self.path), {"record": "f5", "stop": "f6", "loop": "f3", "pause": "f4"})
+
+    def test_a_file_from_before_the_loop_shortcuts_keeps_its_keys_and_gets_the_new_defaults(self):
+        self.write('{"hotkeys": {"record": "f5", "stop": "esc"}}')
+        self.assertEqual(settings.load_hotkeys(self.path), {"record": "f5", "stop": "esc", "loop": "f3", "pause": "f4"})
+
+    def test_a_new_shortcut_whose_default_key_is_taken_gets_the_first_free_function_key(self):
+        cases = {
+            '{"record": "f3", "stop": "f2"}': {"record": "f3", "stop": "f2", "loop": "f1", "pause": "f4"},
+            '{"record": "f1", "stop": "f4"}': {"record": "f1", "stop": "f4", "loop": "f3", "pause": "f2"},
+            '{"record": "f4", "stop": "f3"}': {"record": "f4", "stop": "f3", "loop": "f1", "pause": "f2"},
+            '{"record": "f1", "stop": "f2", "loop": "f4"}': {"record": "f1", "stop": "f2", "loop": "f4", "pause": "f3"},
+            '{"record": "f1", "stop": "f2", "loop": "f8"}': {"record": "f1", "stop": "f2", "loop": "f8", "pause": "f4"},
+        }
+        for saved, expected in cases.items():
+            with self.subTest(saved):
+                self.write(f'{{"hotkeys": {saved}}}')
+                loaded = settings.load_hotkeys(self.path)
+                self.assertEqual(loaded, expected)
+                self.assertEqual(len(set(loaded.values())), 4)
+
+    def test_loading_does_not_rewrite_the_file(self):
+        text = '{"hotkeys": {"record": "f5", "stop": "esc"}}'
+        self.write(text)
+        settings.load_hotkeys(self.path)
+        self.assertEqual(self.path.read_text(encoding="utf-8"), text)
 
 
 class ConfigDirTests(unittest.TestCase):

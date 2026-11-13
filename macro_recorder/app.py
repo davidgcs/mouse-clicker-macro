@@ -17,20 +17,34 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from tkinter import font as tkfont
 
-from . import permissions, settings
+from . import filemanager, icons, permissions, settings
 from .hotkeys import Hotkeys, is_valid_name, key_label
 from .player import Player, parse_loop_settings
 from .recorder import Recorder
 from .recording import Recording, RecordingError, new_macro_path
+from .tooltip import Tooltip
 
 APP_NAME = "Mouse Macro Recorder"
 COUNTDOWN_SECONDS = 3
 POLL_MS = 50
 MACROS_DIR = Path.home() / "MouseMacros"
 CONTENT_WIDTH = 420  # pixels
+FOLDER_BUTTON_SPACE = 56  # pixels the folder button takes next to the path of the macro
 TITLE_BAR_HEIGHT = 40  # pixels above the window content that may belong to its title bar
 LOADED_HINT = "Press Repeat to replay it, or Loop to repeat it."
-ACTION_NAMES = {"record": "starting a recording", "stop": "stopping"}
+MACRO_FILETYPES = [("Macro files", "*.json"), ("All files", "*.*")]
+ACTION_NAMES = {
+    "record": "starting a recording",
+    "stop": "stopping",
+    "loop": "starting or resuming the loop",
+    "pause": "pausing the loop",
+}
+SHORTCUT_ROWS = (
+    ("record", "Start recording now"),
+    ("stop", "Stop"),
+    ("loop", "Start / resume loop"),
+    ("pause", "Pause loop"),
+)
 SELF_TEST_FLAG = "--self-test"
 SELF_TEST_MS = 1000  # how long the self-test keeps the window open
 # The app imports these only when it needs them and carries on without them, so a packaged
@@ -82,7 +96,10 @@ class App:
         self.macro: Recording | None = None
         self.macro_path: Path | None = None
         self.capturing: str | None = None  # the action whose shortcut is being chosen
+        self._dialogs_up = 0  # dialogs showing now; while there is one, whatever is pressed must not start anything
         self.stop_requested = threading.Event()
+        self.pause_requested = threading.Event()
+        self.playing_status: tuple[str, str] = ("Playing", "")  # what the player last said, shown again on resume
         self.messages: queue.Queue = queue.Queue()
         self._status_lock = threading.Lock()
         self._newest_status: tuple[str, str] | None = None
@@ -145,14 +162,26 @@ class App:
 
         macro = ttk.LabelFrame(main, text="Macro", padding=8)
         macro.pack(fill="x", pady=(0, 10))
-        ttk.Label(macro, textvariable=self.macro_var, justify="left", wraplength=CONTENT_WIDTH - 30).pack(anchor="w")
+        info = ttk.Frame(macro)
+        info.pack(fill="x")
+        info.columnconfigure(0, weight=1)
+        ttk.Label(
+            info, textvariable=self.macro_var, justify="left", wraplength=CONTENT_WIDTH - 30 - FOLDER_BUTTON_SPACE
+        ).grid(row=0, column=0, sticky="w")
+        # Kept on self: Tk shows nothing for an image that Python has already let go of.
+        self.folder_icon, self.folder_icon_disabled = icons.folder_icons(root)
+        self.folder_button = ttk.Button(info, image=self.folder_icon, command=self.show_macro_folder)
+        self.folder_button.grid(row=0, column=1, sticky="ne", padx=(8, 0))
+        Tooltip(self.folder_button, f"Show in {filemanager.file_manager_name()}")
         row = ttk.Frame(macro)
         row.pack(fill="x", pady=(8, 0))
-        row.columnconfigure((0, 1), weight=1, uniform="macro")
+        row.columnconfigure((0, 1, 2), weight=1, uniform="macro")
         self.import_button = ttk.Button(row, text="Import…", command=self.import_macro)
+        self.save_as_button = ttk.Button(row, text="Save as…", command=self.save_macro_as)
         self.repeat_button = ttk.Button(row, text="Repeat", command=self.repeat)
         self.import_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
-        self.repeat_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        self.save_as_button.grid(row=0, column=1, sticky="ew", padx=4)
+        self.repeat_button.grid(row=0, column=2, sticky="ew", padx=(4, 0))
 
         loop = ttk.LabelFrame(main, text="Loop", padding=8)
         loop.pack(fill="x", pady=(0, 10))
@@ -169,14 +198,19 @@ class App:
         )
         self.unit_box.grid(row=1, column=2, sticky="w")
         ttk.Label(loop, text="between runs").grid(row=1, column=3, sticky="w", padx=6)
-        self.loop_button = ttk.Button(loop, text="Loop", command=self.loop)
-        self.loop_button.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        loop_buttons = ttk.Frame(loop)
+        loop_buttons.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        loop_buttons.columnconfigure((0, 1), weight=1, uniform="loop")
+        self.loop_button = ttk.Button(loop_buttons, text="Loop", command=self.loop_or_resume)
+        self.pause_button = ttk.Button(loop_buttons, text="Pause", command=self.pause)
+        self.loop_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.pause_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
 
         shortcuts = ttk.LabelFrame(main, text="Shortcuts", padding=8)
         shortcuts.pack(fill="x")
         shortcuts.columnconfigure(0, weight=1)
         self.change_buttons = {}
-        for row_number, (action, text) in enumerate((("record", "Start recording now"), ("stop", "Stop"))):
+        for row_number, (action, text) in enumerate(SHORTCUT_ROWS):
             ttk.Label(shortcuts, text=text).grid(row=row_number, column=0, sticky="w", pady=2)
             ttk.Label(shortcuts, textvariable=self.key_vars[action], width=14, anchor="center", relief="sunken").grid(
                 row=row_number, column=1, padx=6
@@ -205,6 +239,18 @@ class App:
     def _stop_hint(self) -> str:
         return f"Press {key_label(self.keys['stop'])} or click Stop to stop."
 
+    def _playing_hint(self) -> str:
+        pause, stop = (key_label(self.keys[action]) for action in ("pause", "stop"))
+        return f"Press {pause} to pause, {stop} to stop."
+
+    def _paused_hint(self) -> str:
+        loop, stop = (key_label(self.keys[action]) for action in ("loop", "stop"))
+        return f"Press {loop} to resume, {stop} to stop."
+
+    def _show_playback(self, headline: str, detail: str) -> None:
+        hint = self._paused_hint() if self.pause_requested.is_set() else self._playing_hint()
+        self._show(headline, f"{detail}\n{hint}" if detail else hint)
+
     def _refresh_macro_info(self) -> None:
         if self.macro is None:
             self.macro_var.set("No macro yet. Record one, or import a file.")
@@ -216,17 +262,27 @@ class App:
     def _update_controls(self) -> None:
         idle = self.state is State.IDLE and self.capturing is None
         have_macro = self.macro is not None
+        playing = self.state is State.PLAYING
+        # A stopped macro still ends on its own, a moment later: nothing can be paused or resumed then.
+        running = playing and not self.stop_requested.is_set()
+        paused = running and self.pause_requested.is_set()
         for widget, enabled in (
             (self.record_button, idle),
             (self.stop_button, self.state is not State.IDLE),
             (self.import_button, idle),
+            (self.save_as_button, idle and have_macro),
             (self.repeat_button, idle and have_macro),
-            (self.loop_button, idle and have_macro),
+            (self.loop_button, (idle and have_macro) or paused),
+            (self.pause_button, running and not paused),
             (self.times_entry, idle),
             (self.delay_entry, idle),
             (self.unit_box, idle),
         ):
             widget.state(["!disabled" if enabled else "disabled"])
+        self.loop_button.configure(text="Resume" if paused else "Loop")
+        can_show_folder = idle and self.macro_path is not None
+        self.folder_button.state(["!disabled" if can_show_folder else "disabled"])
+        self.folder_button.configure(image=self.folder_icon if can_show_folder else self.folder_icon_disabled)
         for action, button in self.change_buttons.items():
             usable = self.state is State.IDLE and self.capturing in (None, action)
             button.state(["!disabled" if usable else "disabled"])
@@ -236,14 +292,15 @@ class App:
         self.state = state
         self._update_controls()
         if state is State.IDLE:
-            record, stop = (key_label(self.keys[action]) for action in ("record", "stop"))
-            self._show("Ready", f"Press {record} to start recording right away, {stop} to stop.")
+            record, stop, loop = (key_label(self.keys[action]) for action in ("record", "stop", "loop"))
+            hint = f"Press {record} to record right away, {stop} to stop, {loop} to start the loop."
+            self._show("Ready", hint)
         elif state is State.COUNTDOWN:
             self._show(str(COUNTDOWN_SECONDS), "Recording starts at 0. Press Stop to cancel.")
         elif state is State.RECORDING:
             self._show("Recording", "")
         else:
-            self._show("Playing", self._stop_hint())
+            self._show("Playing", self._playing_hint())
 
     def _window_area(self) -> tuple[int, int, int, int]:
         """The screen rectangle covered by this window, including its title bar."""
@@ -258,6 +315,10 @@ class App:
         """Runs on the keyboard listener thread."""
         if action == "stop":
             self.stop_requested.set()  # a running macro stops at once, not on the next poll
+        elif action != "pause" and self.dialog_open:
+            # Dropped here, not when it is handled: a window that does not poll until the dialog has closed
+            # would start it then, long after the key was pressed.
+            return
         self.messages.put(("hotkey", action))
 
     def _post_status(self, headline: str, detail: str) -> None:
@@ -307,35 +368,39 @@ class App:
             self._show("Recording", f"{counts}\n{self._stop_hint()}")
 
     def _handle_hotkey(self, action: str) -> None:
-        if action == "record":
+        if action == "stop":
+            self._stop(via_button=False)
+        elif action == "pause":
+            self.pause()
+        elif self.dialog_open:
+            return  # nothing may start behind a dialog, not even a key that was pressed just before it opened
+        elif action == "record":
             if self.state in (State.IDLE, State.COUNTDOWN) and self.capturing is None:
                 self._begin_recording()
-        elif action == "stop":
-            self._stop(via_button=False)
+        elif action == "loop":
+            self.loop_or_resume()
 
     def _handle_captured(self, action: str, name: str) -> None:
         if self.capturing != action:
             return  # cancelled before the key arrived
-        other = next(candidate for candidate in self.keys if candidate != action)
+        taken_by = next((other for other, key in self.keys.items() if other != action and key == name), None)
         problem = None
         if not is_valid_name(name):
             problem = "That key cannot be used as a shortcut."
-        elif name == self.keys[other]:
-            problem = f"{key_label(name)} is already the shortcut for {ACTION_NAMES[other]}. Choose another key."
+        elif taken_by is not None:
+            problem = f"{key_label(name)} is already the shortcut for {ACTION_NAMES[taken_by]}. Choose another key."
         if problem is None:
             self.keys[action] = name
             self.hotkeys.set_keys(self.keys)
         self._end_capture()
         if problem is not None:
-            messagebox.showwarning("Shortcut not changed", problem, parent=self.root)
+            self._warning("Shortcut not changed", problem)
             return
         self._set_state(State.IDLE)
         try:
             settings.save_hotkeys(self.keys)
         except OSError as exc:
-            messagebox.showwarning(
-                "Shortcut not saved", f"The new shortcut works for now but could not be saved:\n{exc}", parent=self.root
-            )
+            self._warning("Shortcut not saved", f"The new shortcut works for now but could not be saved:\n{exc}")
 
     def _handle_newest_status(self) -> None:
         with self._status_lock:
@@ -344,17 +409,26 @@ class App:
             self._handle_status(*status)
 
     def _handle_status(self, headline: str, detail: str) -> None:
-        if self.state is State.PLAYING:
-            self._show(headline, f"{detail}\n{self._stop_hint()}" if detail else self._stop_hint())
+        if self.state is not State.PLAYING or self.stop_requested.is_set():
+            return
+        paused = self.pause_requested.is_set()
+        if headline == "Paused":
+            if paused:  # otherwise it was resumed before the news got here
+                self._show_playback(headline, detail)
+            return
+        self.playing_status = (headline, detail)
+        if not paused:  # while paused, the window keeps saying so
+            self._show_playback(headline, detail)
 
     def _handle_finished(self, done: int, times: int | None, error: Exception | None) -> None:
         self.worker = None
         if self.state is not State.PLAYING:
             return
         stopped = self.stop_requested.is_set()
+        self.pause_requested.clear()
         self._set_state(State.IDLE)
         if error is not None:
-            messagebox.showerror("Playback failed", str(error), parent=self.root)
+            self._error("Playback failed", str(error))
             return
         self._show("Stopped" if stopped else "Finished", describe_runs(done, times))
 
@@ -371,7 +445,7 @@ class App:
             self.recorder.start()
         except Exception as exc:  # the system refused to let us watch the mouse
             self._set_state(State.IDLE)
-            messagebox.showerror("Could not start recording", str(exc), parent=self.root)
+            self._error("Could not start recording", str(exc))
             return
         self.record_start = self.clock()
         self._set_state(State.RECORDING)
@@ -388,6 +462,7 @@ class App:
         elif self.state is State.PLAYING:
             self.stop_requested.set()
             self._show("Stopping", "")
+            self._update_controls()
 
     def _finish_recording(self, via_button: bool) -> None:
         events = self.recorder.stop()
@@ -402,7 +477,7 @@ class App:
                     f"\n\nAllow Input Monitoring for {permission_holder()} in System Settings > Privacy & Security, "
                     "then restart it."
                 )
-            messagebox.showwarning("Nothing recorded", message, parent=self.root)
+            self._warning("Nothing recorded", message)
             return
         self.macro, self.macro_path = macro, None
         failure = None
@@ -416,33 +491,111 @@ class App:
         self._set_state(State.IDLE)
         self._show("Recorded", LOADED_HINT)
         if failure is not None:
-            messagebox.showerror(
-                "Could not save the macro",
-                f"You can still replay it, but it was not saved to a file:\n{failure}",
-                parent=self.root,
+            self._error(
+                "Could not save the macro", f"You can still replay it, but it was not saved to a file:\n{failure}"
             )
 
-    # ---- files and playback ------------------------------------------------------------
+    # ---- dialogs, files and playback --------------------------------------------------
+
+    @contextlib.contextmanager
+    def _dialogs(self):
+        """While a dialog is up, the shortcuts that would start something are ignored.
+
+        Every dialog goes through here, either directly or through `_error`, `_warning` and `_confirm`.
+        """
+        self._dialogs_up += 1
+        try:
+            yield
+        finally:
+            self._dialogs_up -= 1
+
+    @property
+    def dialog_open(self) -> bool:
+        return self._dialogs_up > 0
+
+    def _error(self, title: str, message: str) -> None:
+        with self._dialogs():
+            messagebox.showerror(title, message, parent=self.root)
+
+    def _warning(self, title: str, message: str) -> None:
+        with self._dialogs():
+            messagebox.showwarning(title, message, parent=self.root)
+
+    def _confirm(self, title: str, message: str) -> bool:
+        with self._dialogs():
+            return messagebox.askyesno(title, message, parent=self.root)
 
     def import_macro(self) -> None:
         if self.state is not State.IDLE or self.capturing is not None:
             return
-        path = filedialog.askopenfilename(
-            parent=self.root,
-            title="Import macro",
-            initialdir=str(self.macros_dir if self.macros_dir.is_dir() else Path.home()),
-            filetypes=[("Macro files", "*.json"), ("All files", "*.*")],
-        )
+        with self._dialogs():
+            path = filedialog.askopenfilename(
+                parent=self.root,
+                title="Import macro",
+                initialdir=str(self.macros_dir if self.macros_dir.is_dir() else Path.home()),
+                filetypes=MACRO_FILETYPES,
+            )
         if not path:
             return
         try:
             macro = Recording.load(Path(path))
         except RecordingError as exc:
-            messagebox.showerror("Could not import the macro", str(exc), parent=self.root)
+            self._error("Could not import the macro", str(exc))
             return
         self.macro, self.macro_path = macro, Path(path)
         self._refresh_macro_info()
         self._show("Imported", LOADED_HINT)
+
+    def _save_suggestion(self) -> tuple[Path, str]:
+        """The folder and the file name the Save as dialog starts with."""
+        if self.macro_path is not None:
+            folder, name = self.macro_path.parent, self.macro_path.name
+        else:
+            folder, name = self.macros_dir, new_macro_path(self.macros_dir).name
+        if not folder.is_dir():
+            folder = self.macros_dir if self.macros_dir.is_dir() else Path.home()
+        return folder, name
+
+    def save_macro_as(self) -> None:
+        if self.state is not State.IDLE or self.capturing is not None or self.macro is None:
+            return
+        folder, name = self._save_suggestion()
+        with self._dialogs():
+            chosen = filedialog.asksaveasfilename(
+                parent=self.root,
+                title="Save macro as",
+                initialdir=str(folder),
+                initialfile=name,
+                defaultextension=".json",
+                filetypes=MACRO_FILETYPES,
+            )
+        if not chosen:
+            return
+        path = Path(chosen)
+        if not path.suffix:
+            # Not every system adds the extension, and one that does not cannot warn about replacing a file.
+            path = path.with_suffix(".json")
+            if path.exists() and not self._confirm(
+                "Replace file?", f"{path.name} already exists. Do you want to replace it?"
+            ):
+                return
+        try:
+            self.macro.save(path)
+        except OSError as exc:
+            self._error("Could not save the macro", str(exc))
+            return
+        self.macro_path = path
+        self._refresh_macro_info()
+        self._show("Saved", LOADED_HINT)
+
+    def show_macro_folder(self) -> None:
+        """Opens the folder of the macro in Finder or File Explorer, with the macro selected."""
+        if self.state is not State.IDLE or self.capturing is not None or self.macro_path is None:
+            return
+        try:
+            filemanager.show_in_file_manager(self.macro_path)
+        except OSError as exc:
+            self._error(f"Could not open {filemanager.file_manager_name()}", str(exc))
 
     def repeat(self) -> None:
         self._play(times=1, delay=0.0)
@@ -451,14 +604,41 @@ class App:
         try:
             times, delay = parse_loop_settings(self.times_var.get(), self.delay_var.get(), self.unit_var.get())
         except ValueError as exc:
-            messagebox.showerror("Loop settings", str(exc), parent=self.root)
+            self._error("Loop settings", str(exc))
             return
         self._play(times, delay)
+
+    def loop_or_resume(self) -> None:
+        """What the Loop button and its shortcut do: start the loop, or carry on with a paused one."""
+        if self.state is State.PLAYING:
+            self.resume()
+        elif self.state is State.IDLE and self.capturing is None:
+            if self.macro is None:  # the button is disabled then, so this is the shortcut
+                self._show("Nothing to loop", "Record a macro or import one first.")
+            else:
+                self.loop()
+
+    def pause(self) -> None:
+        if self.state is not State.PLAYING or self.stop_requested.is_set() or self.pause_requested.is_set():
+            return
+        self.pause_requested.set()
+        # The player says "Paused" once it really stands still, which a held mouse button can delay.
+        self._show("Pausing", self._paused_hint())
+        self._update_controls()
+
+    def resume(self) -> None:
+        if self.state is not State.PLAYING or self.stop_requested.is_set() or not self.pause_requested.is_set():
+            return
+        self.pause_requested.clear()
+        self._show_playback(*self.playing_status)
+        self._update_controls()
 
     def _play(self, times: int | None, delay: float) -> None:
         if self.state is not State.IDLE or self.macro is None or self.capturing is not None:
             return
         self.stop_requested.clear()
+        self.pause_requested.clear()
+        self.playing_status = ("Playing", "")
         self._set_state(State.PLAYING)
         self.worker = threading.Thread(target=self._play_worker, args=(self.macro, times, delay), daemon=True)
         self.worker.start()
@@ -467,7 +647,9 @@ class App:
         """Runs on its own thread so that the window stays responsive."""
         done, error = 0, None
         try:
-            done = self.player.run(macro, self.stop_requested, times, delay, on_status=self._post_status)
+            done = self.player.run(
+                macro, self.stop_requested, times, delay, on_status=self._post_status, pause=self.pause_requested
+            )
         except Exception as exc:  # reported in the window instead of vanishing with the thread
             error = exc
         self.messages.put(("finished", done, times, error))
@@ -497,7 +679,7 @@ class App:
     def close(self) -> None:
         if self.state is State.RECORDING and self.recorder.event_count:
             question = "Close the app and discard the recording?"
-            if not messagebox.askyesno("Recording in progress", question, parent=self.root):
+            if not self._confirm("Recording in progress", question):
                 return
         self.closed = True
         self.stop_requested.set()

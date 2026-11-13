@@ -9,7 +9,9 @@ from pathlib import Path
 
 from .hotkeys import is_valid_name
 
-DEFAULT_HOTKEYS = {"record": "f1", "stop": "f2"}
+DEFAULT_HOTKEYS = {"record": "f1", "stop": "f2", "loop": "f3", "pause": "f4"}
+# Earlier versions saved only these two. A file without the others is an old file, not a broken one.
+REQUIRED_HOTKEYS = ("record", "stop")
 
 
 def config_dir() -> Path:
@@ -25,15 +27,28 @@ def settings_path() -> Path:
 
 
 def load_hotkeys(path: Path | None = None) -> dict[str, str]:
-    """The saved shortcuts, or the defaults when nothing usable has been saved."""
+    """The saved shortcuts, or the defaults when nothing usable has been saved.
+
+    Shortcuts that were added after the file was written get their default key, or the first
+    free function key when the user has already given that key to another action.
+    """
     try:
         data = json.loads((path or settings_path()).read_text(encoding="utf-8"))
-        saved = {action: data["hotkeys"][action] for action in DEFAULT_HOTKEYS}
+        stored = data["hotkeys"]
+        saved = {action: stored[action] for action in REQUIRED_HOTKEYS}
+        saved.update({action: stored[action] for action in DEFAULT_HOTKEYS if action in stored})
     except (OSError, ValueError, RecursionError, KeyError, TypeError):
         return dict(DEFAULT_HOTKEYS)
     if not all(is_valid_name(name) for name in saved.values()) or len(set(saved.values())) < len(saved):
         return dict(DEFAULT_HOTKEYS)
-    return saved
+    taken = set(saved.values())
+    for action, name in DEFAULT_HOTKEYS.items():
+        if action not in saved:
+            if name in taken:
+                name = next(f"f{number}" for number in range(1, 13) if f"f{number}" not in taken)
+            saved[action] = name
+            taken.add(name)
+    return {action: saved[action] for action in DEFAULT_HOTKEYS}
 
 
 def save_hotkeys(keys: dict[str, str], path: Path | None = None) -> None:

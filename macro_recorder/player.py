@@ -18,6 +18,8 @@ DOUBLE_CLICK_PIXELS = 5
 # Clicks and scrolls that follow a pointer jump wait this long (seconds) so the system
 # has applied the move first; pynput reads the pointer position back when it clicks.
 SETTLE_SECONDS = 0.01
+# A player that can be paused looks at its pause flag this often (seconds).
+PAUSE_TICK = 0.05
 
 
 def parse_loop_settings(times_text: str, delay_text: str, unit: str) -> tuple[int | None, float]:
@@ -73,8 +75,20 @@ class Player:
             "right": mouse.Button.right,
         }
 
-    def play_once(self, macro: Recording, stop: threading.Event) -> bool:
-        """Replay the macro once. Returns False if `stop` interrupted it."""
+    def play_once(
+        self,
+        macro: Recording,
+        stop: threading.Event,
+        pause: threading.Event | None = None,
+        on_pause: Callable[[bool], None] = lambda paused: None,
+    ) -> bool:
+        """Replay the macro once. Returns False if `stop` interrupted it.
+
+        While `pause` is set the replay holds still, and it carries on from the same point once
+        `pause` is cleared. A pause waits for a pressed mouse button to be released first, so the
+        button is never left down while the user has the mouse back. on_pause(True) is called when
+        the replay has really paused and on_pause(False) when it carries on.
+        """
         start = self._clock()
         held: set[str] = set()
         last_press: Event | None = None
@@ -84,11 +98,24 @@ class Player:
         series = ExitStack()
         try:
             for event in macro.events:
-                delay = start + event.t - self._clock()
-                if delay > 0:
-                    stop.wait(delay)
-                if stop.is_set():
-                    return False
+                while True:
+                    if pause is not None and pause.is_set() and not held:
+                        series.close()  # whatever is clicked after the pause is a new click
+                        last_press = None
+                        on_pause(True)
+                        paused_for = self._hold(pause, stop)
+                        if paused_for is None:
+                            return False
+                        start += paused_for  # the rest of the macro keeps its timing
+                        pointer = None  # the user may have moved the mouse meanwhile
+                        on_pause(False)
+                    delay = start + event.t - self._clock()
+                    if delay > 0:
+                        stop.wait(delay if pause is None else min(delay, PAUSE_TICK))
+                    if stop.is_set():
+                        return False
+                    if pause is None or delay <= 0:
+                        break
                 target = (event.x, event.y)
                 self._mouse.position = target
                 if event.kind != "move" and target != pointer and stop.wait(SETTLE_SECONDS):
@@ -121,33 +148,68 @@ class Player:
         times: int | None = 1,
         delay: float = 0.0,
         on_status: Callable[[str, str], None] = lambda headline, detail: None,
+        pause: threading.Event | None = None,
     ) -> int:
         """Replay the macro `times` times (forever if None), waiting `delay` seconds between runs.
 
         The first run starts immediately and nothing waits after the last one.
         on_status(headline, detail) is told what is going on, e.g. ("Playing", "Run 2 of 10")
         or ("Waiting", "Run 3 of 10 starts in 25 s"). Returns how many runs were completed.
+
+        While `pause` is set, the replay or the countdown to the next run stands still
+        (on_status reports "Paused") and carries on where it was once `pause` is cleared.
         """
         completed = 0
         while times is None or completed < times:
             progress = f"Run {completed + 1}" + (f" of {times}" if times else "")
-            if completed and not self._wait(delay, progress, stop, on_status):
+            if completed and not self._wait(delay, progress, stop, on_status, pause):
                 break
-            on_status("Playing", "" if times == 1 else progress)
-            if not self.play_once(macro, stop):
+            detail = "" if times == 1 else progress
+            on_status("Playing", detail)
+            if not self.play_once(
+                macro, stop, pause, lambda paused: on_status("Paused" if paused else "Playing", detail)
+            ):
                 break
             completed += 1
         return completed
 
+    def _hold(self, pause: threading.Event, stop: threading.Event) -> float | None:
+        """Block while `pause` is set. Returns how long that took, or None if `stop` ended it."""
+        began = self._clock()
+        while pause.is_set():
+            if stop.wait(PAUSE_TICK):
+                return None
+        return self._clock() - began
+
     def _wait(
-        self, seconds: float, progress: str, stop: threading.Event, on_status: Callable[[str, str], None]
+        self,
+        seconds: float,
+        progress: str,
+        stop: threading.Event,
+        on_status: Callable[[str, str], None],
+        pause: threading.Event | None = None,
     ) -> bool:
-        """Sleep between runs, reporting the time left. Returns False if `stop` interrupted it."""
+        """Sleep between runs, reporting the time left. Returns False if `stop` interrupted it.
+
+        The time a pause lasts is not counted.
+        """
         end = self._clock() + seconds
+        reported = None
         while True:
             left = end - self._clock()
             if left <= 0:
                 return not stop.is_set()
-            on_status("Waiting", f"{progress} starts in {format_duration(math.ceil(left))}")
-            if stop.wait(min(left, 1.0)):
+            message = f"{progress} starts in {format_duration(math.ceil(left))}"
+            if pause is not None and pause.is_set():
+                on_status("Paused", message)
+                paused_for = self._hold(pause, stop)
+                if paused_for is None:
+                    return False
+                end += paused_for
+                reported = None
+                continue
+            if message != reported:
+                on_status("Waiting", message)
+                reported = message
+            if stop.wait(min(left, 1.0 if pause is None else PAUSE_TICK)):
                 return False

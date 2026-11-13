@@ -1,6 +1,8 @@
+import threading
 import unittest
 
 from macro_recorder.player import (
+    PAUSE_TICK,
     SETTLE_SECONDS,
     Player,
     format_duration,
@@ -263,6 +265,171 @@ class RunTests(PlayerTestCase):
         stop.set()
         self.assertEqual(self.player.run(self.macro, stop, 3, 1), 0)
         self.assertEqual(self.mouse.log, [])
+
+
+class PauseTests(PlayerTestCase):
+    """The pause flag is set and cleared from another thread; the fake stop does it at a chosen time.
+
+    A paused player looks at the flag every PAUSE_TICK (0.05 s), so the times below are the ticks
+    that follow the times the flag was changed at (0.22 -> 0.25, 5.02 -> 5.05, ...).
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.pause = threading.Event()
+        self.changes = []  # (paused, time) as the replay reports it
+
+    def keys(self, pause_at, resume_at=None, stop_at=None):
+        stop = self.stop(stop_at)
+        stop.schedule(pause_at, self.pause.set)
+        if resume_at is not None:
+            stop.schedule(resume_at, self.pause.clear)
+        return stop
+
+    def play_once(self, macro, stop):
+        return self.player.play_once(
+            macro, stop, self.pause, lambda paused: self.changes.append((paused, self.clock.now))
+        )
+
+    def times_of(self, kind):
+        return [entry[0] for entry in self.mouse.log if entry[1] == kind]
+
+    def test_the_tick_is_short_enough_to_feel_immediate(self):
+        self.assertLessEqual(PAUSE_TICK, 0.1)
+
+    def test_pausing_holds_the_macro_still_and_the_rest_keeps_its_timing(self):
+        macro = Recording([Event(0.0, "move", 10, 10), press(0.5), release(0.6)])
+        self.assertTrue(self.play_once(macro, self.keys(pause_at=0.22, resume_at=5.02)))
+        (paused, paused_at), (resumed, resumed_at) = self.changes
+        self.assertEqual((paused, resumed), (True, False))
+        self.assertAlmostEqual(paused_at, 0.25)
+        self.assertAlmostEqual(resumed_at, 5.05)
+        self.assertEqual([entry for entry in self.mouse.log if paused_at < entry[0] < resumed_at], [])
+        # 0.25 s of the macro were left when it was paused, and the pointer is placed again first.
+        (press_time,) = self.times_of("press")
+        self.assertAlmostEqual(press_time, resumed_at + 0.25 + SETTLE_SECONDS)
+        (release_time,) = self.times_of("release")
+        self.assertAlmostEqual(release_time, resumed_at + 0.35)
+
+    def test_a_pause_waits_until_no_button_is_held(self):
+        macro = Recording([press(0.0), Event(0.5, "move", 20, 20), release(1.0, 20, 20), Event(1.5, "move", 30, 30)])
+        self.assertTrue(self.play_once(macro, self.keys(pause_at=0.22, resume_at=10.02)))
+        (release_time,) = self.times_of("release")
+        self.assertAlmostEqual(release_time, 1.0)  # on time: the button is not held down through the pause
+        (_, paused_at), (_, resumed_at) = self.changes
+        self.assertAlmostEqual(paused_at, 1.0)
+        self.assertEqual([entry for entry in self.mouse.log if paused_at < entry[0] < resumed_at], [])
+        self.assertAlmostEqual(self.times_of("move")[-1], resumed_at + 0.5)
+
+    def test_a_pause_requested_before_the_start_holds_the_first_event_too(self):
+        self.pause.set()
+        stop = self.stop()
+        stop.schedule(2.02, self.pause.clear)
+        macro = Recording([Event(0.0, "move", 10, 10), Event(0.1, "move", 20, 20)])
+        self.assertTrue(self.play_once(macro, stop))
+        first, second = self.times_of("move")
+        self.assertAlmostEqual(first, 2.05)
+        self.assertAlmostEqual(second, 2.15)
+
+    def test_stopping_while_paused_ends_the_replay_without_carrying_on(self):
+        macro = Recording([Event(0.0, "move", 10, 10), press(1.0), release(2.0)])
+        self.assertFalse(self.play_once(macro, self.keys(pause_at=0.22, stop_at=3.0)))
+        self.assertEqual(self.mouse.actions(), [("move", 10, 10)])
+        self.assertEqual([paused for paused, _ in self.changes], [True])
+
+    def test_a_click_after_a_pause_is_not_a_double_click_with_the_one_before_it(self):
+        macro = Recording([press(0.0), release(0.05), press(0.3), release(0.35)])
+        self.assertTrue(self.play_once(macro, self.keys(pause_at=0.12, resume_at=2.02)))
+        self.assertEqual([entry[2] for entry in self.mouse.actions() if entry[0] == "press"], [1, 1])
+        self.assertEqual((self.mouse.entered, self.mouse.exited), (2, 2))
+
+    def test_a_pause_flag_that_is_never_set_changes_nothing(self):
+        macro = Recording(
+            [Event(0.0, "move", 10, 10), press(0.5), release(0.6), Event(1.0, "scroll", 10, 10, dx=1, dy=-2)]
+        )
+        self.assertTrue(self.play_once(macro, self.stop()))
+        clock = FakeClock()
+        plain = FakeMouse(clock)
+        Player(plain, clock=clock).play_once(macro, FakeStop(clock))
+        self.assertEqual(self.mouse.actions(), plain.actions())
+        self.assertAlmostEqual(self.clock.now, clock.now)
+        self.assertEqual(self.changes, [])
+
+    def test_a_stop_requested_before_playing_plays_nothing_even_when_it_can_be_paused(self):
+        stop = self.stop()
+        stop.set()
+        self.assertFalse(self.play_once(Recording([press(0.0)]), stop))
+        self.assertEqual(self.mouse.log, [])
+
+
+class RunPauseTests(PlayerTestCase):
+    def setUp(self):
+        super().setUp()
+        self.pause = threading.Event()
+        self.statuses = []
+        self.macro = Recording([press(0.0), release(1.0)])  # lasts one second
+
+    def run_macro(self, times, delay, pause_at=None, resume_at=None, stop_at=None, macro=None):
+        stop = self.stop(stop_at)
+        if pause_at is not None:
+            stop.schedule(pause_at, self.pause.set)
+        if resume_at is not None:
+            stop.schedule(resume_at, self.pause.clear)
+        return self.player.run(
+            macro or self.macro,
+            stop,
+            times,
+            delay,
+            on_status=lambda *status: self.statuses.append(status),
+            pause=self.pause,
+        )
+
+    def press_times(self):
+        return [entry[0] for entry in self.mouse.log if entry[1] == "press"]
+
+    def test_a_pause_between_runs_freezes_the_countdown(self):
+        self.assertEqual(self.run_macro(2, 10, pause_at=4.22, resume_at=100.02), 2)
+        frozen = ("Paused", "Run 2 of 2 starts in 7 s")  # 6.75 s were left
+        self.assertEqual(self.statuses.count(frozen), 1)
+        after = self.statuses[self.statuses.index(frozen) + 1]
+        self.assertEqual(after, ("Waiting", "Run 2 of 2 starts in 7 s"))
+        first, second = self.press_times()
+        self.assertAlmostEqual(first, SETTLE_SECONDS)
+        # The macro (1 s), the delay (10 s) and the time spent paused (from the tick at 4.25 to the one at 100.05).
+        self.assertAlmostEqual(second, 1.0 + 10 + (100.05 - 4.25) + SETTLE_SECONDS)
+
+    def test_a_pause_during_a_run_reports_paused_and_then_playing_again(self):
+        macro = Recording([Event(0.0, "move", 10, 10), Event(1.0, "move", 20, 20)])
+        self.assertEqual(self.run_macro(3, 5, pause_at=0.22, resume_at=3.02, macro=macro), 3)
+        self.assertEqual(
+            self.statuses[:3], [("Playing", "Run 1 of 3"), ("Paused", "Run 1 of 3"), ("Playing", "Run 1 of 3")]
+        )
+
+    def test_a_single_replay_can_be_paused_too(self):
+        macro = Recording([Event(0.0, "move", 10, 10), Event(1.0, "move", 20, 20)])
+        self.assertEqual(self.run_macro(1, 0, pause_at=0.22, resume_at=3.02, macro=macro), 1)
+        self.assertEqual(self.statuses, [("Playing", ""), ("Paused", ""), ("Playing", "")])
+
+    def test_a_pause_requested_while_a_button_is_down_takes_effect_once_it_is_released(self):
+        self.assertEqual(self.run_macro(2, 5, pause_at=0.22, resume_at=20.02), 2)
+        self.assertEqual(self.statuses[:2], [("Playing", "Run 1 of 2"), ("Paused", "Run 2 of 2 starts in 5 s")])
+        release_time = next(entry[0] for entry in self.mouse.log if entry[1] == "release")
+        self.assertAlmostEqual(release_time, 1.0)
+
+    def test_stopping_while_paused_ends_the_loop(self):
+        self.assertEqual(self.run_macro(10, 25, pause_at=4.22, stop_at=50), 1)
+        self.assertEqual(self.statuses[-1], ("Paused", "Run 2 of 10 starts in 22 s"))
+        self.assertEqual(len(self.press_times()), 1)
+
+    def test_a_pause_flag_that_is_never_set_reports_what_a_plain_run_does(self):
+        clock = FakeClock()
+        plain, plain_statuses = FakeMouse(clock), []
+        Player(plain, clock=clock).run(
+            self.macro, FakeStop(clock), 3, 7, on_status=lambda *status: plain_statuses.append(status)
+        )
+        self.assertEqual(self.run_macro(3, 7), 3)
+        self.assertEqual(self.statuses, plain_statuses)
+        self.assertEqual(self.mouse.actions(), plain.actions())
 
 
 class ParseLoopSettingsTests(unittest.TestCase):

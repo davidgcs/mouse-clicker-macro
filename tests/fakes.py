@@ -15,6 +15,7 @@ class FakeStop(threading.Event):
     """An Event whose wait() moves a FakeClock forward instead of sleeping.
 
     It sets itself once the clock reaches `stop_at`, like a user pressing the stop key.
+    `schedule(at, callback)` does the same for any other key, e.g. `pause.set` or `pause.clear`.
     """
 
     def __init__(self, clock, stop_at=None):
@@ -22,10 +23,18 @@ class FakeStop(threading.Event):
         self.clock = clock
         self.stop_at = stop_at
         self.waits = []
+        self.scheduled = []
+
+    def schedule(self, at, callback):
+        self.scheduled.append((at, callback))
 
     def wait(self, timeout=None):
         self.waits.append(timeout)
         self.clock.now += timeout
+        due = sorted((entry for entry in self.scheduled if self.clock.now >= entry[0]), key=lambda entry: entry[0])
+        for entry in due:
+            self.scheduled.remove(entry)
+            entry[1]()
         if self.stop_at is not None and self.clock.now >= self.stop_at:
             self.set()
         return self.is_set()
@@ -155,10 +164,12 @@ class FakePlayer:
         self.statuses = statuses
         self.error = error
         self.block = block  # wait for the stop signal, like a long macro
+        self.pause = None  # the pause flag the window handed to the last run
         self.reported = threading.Event()  # set once every status has been reported
 
-    def run(self, macro, stop, times=1, delay=0.0, on_status=lambda headline, detail: None):
+    def run(self, macro, stop, times=1, delay=0.0, on_status=lambda headline, detail: None, pause=None):
         self.calls.append((macro, times, delay))
+        self.pause = pause
         for status in self.statuses:
             on_status(*status)
         self.reported.set()

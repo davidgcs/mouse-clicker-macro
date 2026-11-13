@@ -28,9 +28,30 @@ CAPTURE = [Event(5.0, "move", 400, 300), click(5.5), click(5.6, pressed=False)]
 # The same recording once it has been turned into a macro.
 SAMPLE = [Event(0.0, "move", 400, 300), click(0.5), click(0.6, pressed=False)]
 
-CONTROLS = ("record", "stop", "import", "repeat", "loop", "times", "delay", "unit", "change_record", "change_stop")
-IDLE_WITHOUT_MACRO = ("record", "import", "times", "delay", "unit", "change_record", "change_stop")
-IDLE_WITH_MACRO = IDLE_WITHOUT_MACRO + ("repeat", "loop")
+KEYS = {"record": "f1", "stop": "f2", "loop": "f3", "pause": "f4"}
+CONTROLS = (
+    "record",
+    "stop",
+    "import",
+    "save_as",
+    "folder",
+    "repeat",
+    "loop",
+    "pause",
+    "times",
+    "delay",
+    "unit",
+    "change_record",
+    "change_stop",
+    "change_loop",
+    "change_pause",
+)
+CHANGE_BUTTONS = ("change_record", "change_stop", "change_loop", "change_pause")
+IDLE_WITHOUT_MACRO = ("record", "import", "times", "delay", "unit") + CHANGE_BUTTONS
+# Every macro the tests load or record has a file, so the folder button works too.
+IDLE_WITH_MACRO = IDLE_WITHOUT_MACRO + ("save_as", "folder", "repeat", "loop")
+PLAYING_HINT = "Press F4 to pause, F2 to stop."
+PAUSED_HINT = "Press F3 to resume, F2 to stop."
 
 
 def controls(*enabled):
@@ -65,12 +86,22 @@ class AppTestCase(unittest.TestCase):
         self.recorder = FakeRecorder(CAPTURE)
         self.player = FakePlayer()
         self.save_hotkeys = self.patch(app_module.settings, "save_hotkeys")
-        self.patch(app_module.settings, "load_hotkeys", side_effect=lambda: {"record": "f1", "stop": "f2"})
+        self.patch(app_module.settings, "load_hotkeys", side_effect=lambda: dict(KEYS))
         self.missing_permissions = self.patch(app_module.permissions, "missing_permissions", return_value=[])
         self.open_settings = self.patch(app_module.permissions, "open_privacy_settings")
         self.messagebox = self.patch(app_module, "messagebox")
         self.filedialog = self.patch(app_module, "filedialog")
         self.filedialog.askopenfilename.return_value = ""  # the dialog is cancelled unless a test picks a file
+        self.filedialog.asksaveasfilename.return_value = ""
+        for dialog in (
+            self.messagebox.showerror,
+            self.messagebox.showwarning,
+            self.messagebox.askyesno,
+            self.filedialog.askopenfilename,
+            self.filedialog.asksaveasfilename,
+        ):
+            dialog.side_effect = self.announced
+        self.show_in_file_manager = self.patch(app_module.filemanager, "show_in_file_manager")
         self.bell = mock.Mock()
         self._app = None
         self._hotkeys = None
@@ -79,6 +110,11 @@ class AppTestCase(unittest.TestCase):
         patcher = mock.patch.object(target, name, **kwargs)
         self.addCleanup(patcher.stop)
         return patcher.start()
+
+    def announced(self, *args, **kwargs):
+        """Runs whenever the window shows a dialog, which it must have announced: see `App._dialogs`."""
+        self.assertTrue(self.app.dialog_open, "a dialog was shown without ignoring the shortcuts that start things")
+        return mock.DEFAULT  # the mock goes on to return what the test made it return
 
     @property
     def app(self):
@@ -166,13 +202,15 @@ class AppTestCase(unittest.TestCase):
             "record": app.record_button,
             "stop": app.stop_button,
             "import": app.import_button,
+            "save_as": app.save_as_button,
+            "folder": app.folder_button,
             "repeat": app.repeat_button,
             "loop": app.loop_button,
+            "pause": app.pause_button,
             "times": app.times_entry,
             "delay": app.delay_entry,
             "unit": app.unit_box,
-            "change_record": app.change_buttons["record"],
-            "change_stop": app.change_buttons["stop"],
+            **{f"change_{action}": button for action, button in app.change_buttons.items()},
         }
         return {name: not widget.instate(["disabled"]) for name, widget in widgets.items()}
 
@@ -194,14 +232,17 @@ class StartupTests(AppTestCase):
         self.assertIs(self.app.state, State.IDLE)
         status, detail = self.shown()
         self.assertEqual(status, "Ready")
-        self.assertIn("F1", detail)
-        self.assertIn("F2", detail)
+        self.assertEqual(detail, "Press F1 to record right away, F2 to stop, F3 to start the loop.")
         shown_keys = {action: var.get() for action, var in self.app.key_vars.items()}
-        self.assertEqual(shown_keys, {"record": "F1", "stop": "F2"})
+        self.assertEqual(shown_keys, {"record": "F1", "stop": "F2", "loop": "F3", "pause": "F4"})
 
     def test_the_shortcuts_are_listened_for_from_the_start(self):
-        self.assertEqual(self.hotkeys.keys, {"record": "f1", "stop": "f2"})
+        self.assertEqual(self.hotkeys.keys, KEYS)
         self.assertEqual(self.hotkeys.started, 1)
+
+    def test_every_shortcut_has_a_row_to_change_it(self):
+        self.assertEqual(tuple(self.app.change_buttons), tuple(KEYS))
+        self.assertEqual(tuple(self.app.key_vars), tuple(KEYS))
 
     def test_the_loop_settings_start_with_the_defaults(self):
         self.assertEqual(self.app.times_var.get(), "")
@@ -530,9 +571,7 @@ class RecordingTests(AppTestCase):
         self.assertEqual(self.app.macro.events, SAMPLE)
         self.assertIsNone(self.app.macro_path)
         self.assertIn("Not saved to a file", self.app.macro_var.get())
-        self.assertEqual(self.enabled(), controls(*IDLE_WITH_MACRO))
-
-    def test_a_second_recording_gets_its_own_file(self):
+        self.assertEqual(self.enabled(), controls(*set(IDLE_WITH_MACRO) - {"folder"}))  # there is no file to show
         for _ in range(2):
             self.press("record")
             self.press("stop")
@@ -628,7 +667,7 @@ class PlaybackTests(AppTestCase):
     def test_repeat_plays_the_macro_once(self):
         self.app.repeat()
         self.assertIs(self.app.state, State.PLAYING)
-        self.assertEqual(self.shown(), ("Playing", "Press F2 or click Stop to stop."))
+        self.assertEqual(self.shown(), ("Playing", PLAYING_HINT))
         self.finish_worker()
         self.assertEqual(self.player.calls, [(self.app.macro, 1, 0.0)])
         self.assertIs(self.app.state, State.IDLE)
@@ -686,7 +725,7 @@ class PlaybackTests(AppTestCase):
         ):
             self.app._post_status(headline, detail)
             self.app._drain()
-            self.assertEqual(self.shown(), (headline, f"{detail}\nPress F2 or click Stop to stop."))
+            self.assertEqual(self.shown(), (headline, f"{detail}\n{PLAYING_HINT}"))
 
     def test_a_player_reporting_faster_than_the_window_polls_cannot_flood_the_queue(self):
         self.player.statuses = [("Playing", f"Run {number}") for number in range(1, 5001)]
@@ -695,7 +734,7 @@ class PlaybackTests(AppTestCase):
         self.assertTrue(self.player.reported.wait(5))
         self.assertEqual(self.app.messages.qsize(), 1)
         self.app._drain()
-        self.assertEqual(self.shown(), ("Playing", "Run 5000\nPress F2 or click Stop to stop."))
+        self.assertEqual(self.shown(), ("Playing", f"Run 5000\n{PLAYING_HINT}"))
         self.assertEqual(self.app.messages.qsize(), 0)
 
     def test_a_drain_ends_even_when_a_thread_keeps_filling_the_queue(self):
@@ -713,13 +752,13 @@ class PlaybackTests(AppTestCase):
         self.assertEqual(handled, ["first"])
         self.assertEqual(self.app.messages.qsize(), 1)  # left for the next poll
 
-    def test_statuses_are_shown_with_the_stop_hint(self):
+    def test_statuses_are_shown_with_the_pause_and_stop_hint(self):
         self.player.block = True
         self.app.loop()
         self.app._handle_status("Waiting", "Run 2 of 10 starts in 25 s")
-        self.assertEqual(self.shown(), ("Waiting", "Run 2 of 10 starts in 25 s\nPress F2 or click Stop to stop."))
+        self.assertEqual(self.shown(), ("Waiting", f"Run 2 of 10 starts in 25 s\n{PLAYING_HINT}"))
         self.app._handle_status("Playing", "")
-        self.assertEqual(self.shown(), ("Playing", "Press F2 or click Stop to stop."))
+        self.assertEqual(self.shown(), ("Playing", PLAYING_HINT))
 
     def test_a_late_status_is_ignored(self):
         before = self.shown()
@@ -775,7 +814,7 @@ class PlaybackTests(AppTestCase):
         self.assertEqual(self.recorder.starts, 0)
         self.assertEqual(len(self.player.calls), 1)
         self.filedialog.askopenfilename.assert_called_once()  # only the import that loaded the macro
-        self.assertEqual(self.enabled(), controls("stop"))
+        self.assertEqual(self.enabled(), controls("stop", "pause"))
 
     def test_repeat_and_loop_need_a_macro(self):
         app = self.app
@@ -823,9 +862,53 @@ class LoopThroughTheRealPlayerTests(AppTestCase):
         self.assertEqual(self.shown()[0], "Stopped")
         self.assertEqual(mouse.entered, mouse.exited)
 
+    def wait_until(self, condition, what):
+        give_up = time.monotonic() + 5
+        while not condition():
+            self.assertLess(time.monotonic(), give_up, f"timed out waiting for {what}")
+            time.sleep(0.01)
+            self.app._drain()
+
+    def test_a_loop_stands_still_while_paused_and_carries_on_when_resumed(self):
+        mouse = FakeMouse()
+        self.player = Player(mouse)
+        self.load_macro(events=self.QUICK_MACRO)
+        self.app.delay_var.set("0.01")
+        self.app.loop()
+        self.wait_until(lambda: self.presses(mouse) >= 2, "the loop to start")
+        self.press("pause")
+        self.wait_until(lambda: self.app.status_var.get() == "Paused", "the player to stand still")
+        self.assertEqual(self.app.detail_var.get().splitlines()[-1], PAUSED_HINT)
+        frozen = self.presses(mouse)
+        time.sleep(0.3)
+        self.app._drain()
+        self.assertEqual(self.presses(mouse), frozen)
+        self.assertEqual(self.app.status_var.get(), "Paused")
+        self.press("loop")
+        self.wait_until(lambda: self.presses(mouse) > frozen, "the loop to carry on")
+        self.assertIn(self.app.status_var.get(), ("Playing", "Waiting"))
+        self.hotkeys.on_action("stop")
+        self.finish_worker()
+        self.assertEqual(self.shown()[0], "Stopped")
+        self.assertEqual(mouse.entered, mouse.exited)
+
+    def test_a_paused_loop_can_be_stopped(self):
+        mouse = FakeMouse()
+        self.player = Player(mouse)
+        self.load_macro(events=self.QUICK_MACRO)
+        self.app.delay_var.set("0.01")
+        self.app.loop()
+        self.wait_until(lambda: self.presses(mouse) >= 1, "the loop to start")
+        self.press("pause")
+        self.wait_until(lambda: self.app.status_var.get() == "Paused", "the player to stand still")
+        self.hotkeys.on_action("stop")
+        self.finish_worker()
+        self.assertEqual(self.shown()[0], "Stopped")
+        self.assertEqual(mouse.entered, mouse.exited)
+
 
 class ControlsTests(AppTestCase):
-    def test_only_stop_is_usable_while_busy(self):
+    def test_only_stop_and_pause_are_usable_while_busy(self):
         self.load_macro()
         app = self.app
         app.start_countdown()
@@ -838,7 +921,7 @@ class ControlsTests(AppTestCase):
         app.stop_from_button()
         self.player.block = True
         app.loop()
-        self.assertEqual(self.enabled(), controls("stop"))
+        self.assertEqual(self.enabled(), controls("stop", "pause"))
 
     def test_changing_a_shortcut_disables_everything_but_its_cancel_button(self):
         self.load_macro()
@@ -862,9 +945,9 @@ class ShortcutTests(AppTestCase):
         self.assertIsNotNone(self.hotkeys.capture)
         self.capture("f5")
         self.assertIsNone(app.capturing)
-        self.assertEqual(app.keys, {"record": "f5", "stop": "f2"})
-        self.assertEqual(self.hotkeys.keys, {"record": "f5", "stop": "f2"})
-        self.save_hotkeys.assert_called_once_with({"record": "f5", "stop": "f2"})
+        self.assertEqual(app.keys, {**KEYS, "record": "f5"})
+        self.assertEqual(self.hotkeys.keys, {**KEYS, "record": "f5"})
+        self.save_hotkeys.assert_called_once_with({**KEYS, "record": "f5"})
         self.assertEqual(app.key_vars["record"].get(), "F5")
         self.assertIn("F5", app.detail_var.get())
         self.assertEqual(str(app.change_buttons["record"].cget("text")), "Change…")
@@ -874,8 +957,23 @@ class ShortcutTests(AppTestCase):
     def test_the_stop_shortcut_can_be_changed_too(self):
         self.app.change_shortcut("stop")
         self.capture("esc")
-        self.assertEqual(self.app.keys, {"record": "f1", "stop": "esc"})
+        self.assertEqual(self.app.keys, {**KEYS, "stop": "esc"})
         self.assertIn("Esc", self.app.detail_var.get())
+
+    def test_the_loop_and_pause_shortcuts_can_be_changed_too(self):
+        app = self.app
+        for action, key, label in (("loop", "f7", "F7"), ("pause", "f8", "F8")):
+            with self.subTest(action=action):
+                app.change_shortcut(action)
+                self.assertEqual(app.capturing, action)
+                self.assertEqual(app.key_vars[action].get(), "Press a key...")
+                self.capture(key)
+                self.assertEqual(app.keys[action], key)
+                self.assertEqual(self.hotkeys.keys[action], key)
+                self.assertEqual(app.key_vars[action].get(), label)
+        self.assertEqual(app.keys, {**KEYS, "loop": "f7", "pause": "f8"})
+        self.assertEqual(self.save_hotkeys.call_count, 2)  # every change is saved
+        self.assertIn("F7", app.detail_var.get())  # the hint names the loop key
 
     def test_pressing_the_button_again_cancels(self):
         app = self.app
@@ -894,11 +992,11 @@ class ShortcutTests(AppTestCase):
         app.change_shortcut("record")
         callback("f5")
         app._drain()
-        self.assertEqual(app.keys, {"record": "f1", "stop": "f2"})
+        self.assertEqual(app.keys, KEYS)
         self.assertNoDialog()
         self.save_hotkeys.assert_not_called()
 
-    def test_a_key_already_used_by_the_other_action_is_refused(self):
+    def test_a_key_already_used_by_another_action_is_refused(self):
         app = self.app
         app.change_shortcut("record")
         self.capture("f2")
@@ -906,17 +1004,30 @@ class ShortcutTests(AppTestCase):
         self.assertEqual(title, "Shortcut not changed")
         self.assertIn("F2", message)
         self.assertIn("stopping", message)
-        self.assertEqual(app.keys, {"record": "f1", "stop": "f2"})
-        self.assertEqual(self.hotkeys.keys, {"record": "f1", "stop": "f2"})
+        self.assertEqual(app.keys, KEYS)
+        self.assertEqual(self.hotkeys.keys, KEYS)
         self.assertEqual(app.key_vars["record"].get(), "F1")
         self.assertIsNone(app.capturing)
         self.save_hotkeys.assert_not_called()
 
-    def test_the_stop_shortcut_cannot_take_the_record_key_either(self):
-        self.app.change_shortcut("stop")
-        self.capture("f1")
-        self.assertIn("starting a recording", self.messagebox.showwarning.call_args.args[1])
-        self.assertEqual(self.app.keys["stop"], "f2")
+    def test_no_action_can_take_the_key_of_another(self):
+        names = {
+            "record": "starting a recording",
+            "stop": "stopping",
+            "loop": "starting or resuming the loop",
+            "pause": "pausing the loop",
+        }
+        for action in KEYS:
+            for other, key in KEYS.items():
+                if other == action:
+                    continue
+                with self.subTest(action=action, key=key):
+                    self.messagebox.showwarning.reset_mock()
+                    self.app.change_shortcut(action)
+                    self.capture(key)
+                    self.assertIn(names[other], self.messagebox.showwarning.call_args.args[1])
+                    self.assertEqual(self.app.keys, KEYS)
+        self.save_hotkeys.assert_not_called()
 
     def test_choosing_the_key_it_already_has_is_fine(self):
         self.app.change_shortcut("record")
@@ -964,6 +1075,605 @@ class ShortcutTests(AppTestCase):
         self.assertEqual(self.player.calls, [])
 
 
+class LoopShortcutTests(AppTestCase):
+    """The loop shortcut does what the Loop button does."""
+
+    def test_it_starts_the_loop_with_the_values_in_the_window(self):
+        self.load_macro()
+        self.app.times_var.set("3")
+        self.app.delay_var.set("2")
+        self.press("loop")
+        self.assertIs(self.app.state, State.PLAYING)
+        self.finish_worker()
+        self.assertEqual(self.player.calls, [(self.app.macro, 3, 2.0)])
+        self.assertEqual(self.shown(), ("Finished", "3 of 3 runs completed"))
+
+    def test_without_a_macro_it_says_so_and_nothing_starts(self):
+        self.press("loop")
+        self.assertEqual(self.shown(), ("Nothing to loop", "Record a macro or import one first."))
+        self.assertIs(self.app.state, State.IDLE)
+        self.assertEqual(self.player.calls, [])
+        self.assertNoDialog()
+
+    def test_invalid_loop_settings_are_reported_like_the_button_does(self):
+        self.load_macro()
+        self.app.times_var.set("abc")
+        self.press("loop")
+        self.assertEqual(self.messagebox.showerror.call_args.args[0], "Loop settings")
+        self.assertEqual(self.player.calls, [])
+        self.assertIs(self.app.state, State.IDLE)
+
+    def test_it_does_nothing_while_counting_down_recording_or_choosing_a_key(self):
+        self.load_macro()
+        app = self.app
+        app.start_countdown()
+        self.press("loop")
+        self.assertIs(app.state, State.COUNTDOWN)
+        app.stop_from_button()
+        self.press("record")
+        self.press("loop")
+        self.assertIs(app.state, State.RECORDING)
+        app.stop_from_button()
+        app.change_shortcut("stop")
+        self.press("loop")
+        self.assertIs(app.state, State.IDLE)
+        self.assertEqual(self.player.calls, [])
+
+    def test_it_does_not_start_a_second_loop_while_one_is_running(self):
+        self.load_macro()
+        self.player.block = True
+        self.press("loop")
+        self.press("loop")
+        self.assertEqual(len(self.player.calls), 1)
+        self.assertEqual(self.shown(), ("Playing", PLAYING_HINT))
+
+
+class PausedPlaybackTests(AppTestCase):
+    """The pause shortcut holds a running macro, the loop shortcut (or the Loop button) carries on."""
+
+    def setUp(self):
+        super().setUp()
+        self.load_macro()
+        self.player.block = True
+
+    def start(self, times="10"):
+        self.app.times_var.set(times)
+        self.app.loop()
+
+    def test_the_player_is_given_the_pause_flag(self):
+        self.start()
+        self.assertTrue(self.player.reported.wait(5))
+        self.assertIs(self.player.pause, self.app.pause_requested)
+
+    def test_the_pause_shortcut_pauses(self):
+        self.start()
+        self.press("pause")
+        self.assertTrue(self.app.pause_requested.is_set())
+        self.assertEqual(self.shown(), ("Pausing", PAUSED_HINT))
+        self.assertEqual(self.enabled(), controls("stop", "loop"))
+        self.assertEqual(str(self.app.loop_button.cget("text")), "Resume")
+
+    def test_the_pause_button_pauses(self):
+        self.start()
+        self.app.pause_button.invoke()
+        self.assertTrue(self.app.pause_requested.is_set())
+        self.assertEqual(self.shown(), ("Pausing", PAUSED_HINT))
+
+    def test_a_single_repeat_can_be_paused_too(self):
+        self.app.repeat()
+        self.press("pause")
+        self.assertEqual(self.shown(), ("Pausing", PAUSED_HINT))
+        self.press("loop")
+        self.assertEqual(self.shown(), ("Playing", PLAYING_HINT))
+        self.assertEqual(len(self.player.calls), 1)
+
+    def test_the_window_says_paused_once_the_player_stands_still(self):
+        self.start()
+        self.press("pause")
+        self.app._handle_status("Paused", "Run 3 of 10")
+        self.assertEqual(self.shown(), ("Paused", f"Run 3 of 10\n{PAUSED_HINT}"))
+
+    def test_a_report_of_a_pause_that_is_already_over_is_ignored(self):
+        self.start()
+        self.press("pause")
+        self.press("loop")
+        self.app._handle_status("Paused", "Run 3 of 10")
+        self.assertEqual(self.shown(), ("Playing", PLAYING_HINT))
+
+    def test_the_loop_shortcut_resumes_and_shows_what_the_player_last_said(self):
+        self.start()
+        self.app._handle_status("Waiting", "Run 4 of 10 starts in 5 s")
+        self.press("pause")
+        self.app._handle_status("Paused", "Run 4 of 10 starts in 5 s")
+        self.press("loop")
+        self.assertFalse(self.app.pause_requested.is_set())
+        self.assertEqual(self.shown(), ("Waiting", f"Run 4 of 10 starts in 5 s\n{PLAYING_HINT}"))
+        self.assertEqual(self.enabled(), controls("stop", "pause"))
+        self.assertEqual(str(self.app.loop_button.cget("text")), "Loop")
+        self.assertEqual(len(self.player.calls), 1)  # it carried on, it did not start another loop
+
+    def test_the_loop_button_says_resume_and_resumes(self):
+        self.start()
+        self.press("pause")
+        self.assertEqual(str(self.app.loop_button.cget("text")), "Resume")
+        self.app.loop_button.invoke()
+        self.assertFalse(self.app.pause_requested.is_set())
+        self.assertEqual(self.shown(), ("Playing", PLAYING_HINT))
+        self.assertEqual(len(self.player.calls), 1)
+
+    def test_what_the_player_says_while_paused_is_shown_after_resuming(self):
+        self.start()
+        self.press("pause")
+        self.app._handle_status("Paused", "Run 3 of 10")
+        self.app._handle_status("Waiting", "Run 4 of 10 starts in 5 s")
+        self.assertEqual(self.shown(), ("Paused", f"Run 3 of 10\n{PAUSED_HINT}"))
+        self.press("loop")
+        self.assertEqual(self.shown(), ("Waiting", f"Run 4 of 10 starts in 5 s\n{PLAYING_HINT}"))
+
+    def test_pausing_twice_or_resuming_a_running_macro_changes_nothing(self):
+        self.start()
+        running = self.shown()
+        self.press("loop")
+        self.assertEqual(self.shown(), running)
+        self.assertEqual(len(self.player.calls), 1)
+        self.press("pause")
+        paused = self.shown()
+        self.press("pause")
+        self.assertEqual(self.shown(), paused)
+
+    def test_a_paused_macro_can_be_stopped(self):
+        self.player.completed = 2
+        self.start()
+        self.press("pause")
+        self.app._handle_status("Paused", "Run 3 of 10")
+        self.press("stop")
+        self.assertTrue(self.app.stop_requested.is_set())
+        self.assertEqual(self.shown(), ("Stopping", ""))
+        self.assertEqual(self.enabled(), controls("stop"))
+        self.assertEqual(str(self.app.loop_button.cget("text")), "Loop")
+        self.app._handle_status("Playing", "Run 3 of 10")  # news that is out of date by now
+        self.assertEqual(self.shown(), ("Stopping", ""))
+        self.finish_worker()
+        self.assertEqual(self.shown(), ("Stopped", "2 of 10 runs completed"))
+        self.assertEqual(self.enabled(), controls(*IDLE_WITH_MACRO))
+        self.assertFalse(self.app.pause_requested.is_set())
+
+    def test_nothing_can_be_resumed_once_it_is_stopping(self):
+        self.start()
+        self.press("pause")
+        self.app.stop_from_button()  # the worker may be gone before the next poll
+        self.app.resume()
+        self.assertTrue(self.app.pause_requested.is_set())  # still held until the worker has gone
+        self.assertEqual(self.shown(), ("Stopping", ""))
+        self.finish_worker()
+        self.assertFalse(self.app.pause_requested.is_set())
+
+    def test_nothing_can_be_paused_once_it_is_stopping(self):
+        self.start()
+        self.app.stop_from_button()
+        self.app.pause()
+        self.assertFalse(self.app.pause_requested.is_set())
+        self.assertEqual(self.shown(), ("Stopping", ""))
+        self.assertEqual(self.enabled(), controls("stop"))
+        self.finish_worker()
+
+    def test_a_new_playback_does_not_start_paused(self):
+        self.start()
+        self.press("pause")
+        self.press("stop")
+        self.finish_worker()
+        self.player.block = False
+        self.app.repeat()
+        self.assertFalse(self.app.pause_requested.is_set())
+        self.assertEqual(self.shown(), ("Playing", PLAYING_HINT))
+        self.finish_worker()
+        self.assertEqual(self.shown(), ("Finished", ""))
+
+    def test_a_macro_that_ends_while_pausing_ends_normally(self):
+        self.start("1")
+        self.press("pause")
+        self.app._handle_finished(1, 1, None)  # the player was done before it saw the request
+        self.assertIs(self.app.state, State.IDLE)
+        self.assertFalse(self.app.pause_requested.is_set())
+        self.assertEqual(self.shown(), ("Finished", ""))
+        self.assertEqual(self.enabled(), controls(*IDLE_WITH_MACRO))
+        self.assertEqual(str(self.app.loop_button.cget("text")), "Loop")
+
+    def test_the_hints_name_the_chosen_keys(self):
+        self.app.keys.update(pause="f8", loop="f7", stop="esc")
+        self.assertEqual(self.app._playing_hint(), "Press F8 to pause, Esc to stop.")
+        self.assertEqual(self.app._paused_hint(), "Press F7 to resume, Esc to stop.")
+
+
+class PauseOutsidePlaybackTests(AppTestCase):
+    def test_the_pause_shortcut_and_button_do_nothing_when_nothing_plays(self):
+        self.load_macro()
+        before = self.shown()
+        self.press("pause")
+        self.app.pause()
+        self.assertEqual(self.shown(), before)
+        self.assertFalse(self.app.pause_requested.is_set())
+        self.assertEqual(self.enabled(), controls(*IDLE_WITH_MACRO))
+
+    def test_it_does_nothing_while_counting_down_or_recording(self):
+        self.app.start_countdown()
+        self.press("pause")
+        self.assertIs(self.app.state, State.COUNTDOWN)
+        self.app.stop_from_button()
+        self.press("record")
+        self.press("pause")
+        self.assertIs(self.app.state, State.RECORDING)
+        self.assertFalse(self.app.pause_requested.is_set())
+        self.assertEqual(self.shown()[0], "Recording")
+
+
+class SaveAsTests(AppTestCase):
+    def setUp(self):
+        super().setUp()
+        self.path = self.load_macro()
+
+    def choose(self, path):
+        self.filedialog.asksaveasfilename.return_value = str(path)
+
+    def test_the_macro_is_written_to_the_chosen_file_which_becomes_the_current_one(self):
+        chosen = self.tmp / "elsewhere" / "my macro.json"
+        chosen.parent.mkdir()
+        self.choose(chosen)
+        self.app.save_macro_as()
+        self.assertEqual(Recording.load(chosen).events, SAMPLE)
+        self.assertEqual(self.app.macro_path, chosen)
+        self.assertIn(str(chosen), self.app.macro_var.get())
+        self.assertEqual(self.shown(), ("Saved", app_module.LOADED_HINT))
+        self.assertEqual(self.enabled(), controls(*IDLE_WITH_MACRO))
+        self.assertTrue(self.path.exists())  # the original is left alone
+        self.assertNoDialog()
+
+    def test_the_dialog_starts_with_the_folder_and_name_of_the_current_macro(self):
+        self.app.save_macro_as()
+        self.filedialog.asksaveasfilename.assert_called_once_with(
+            parent=self.app.root,
+            title="Save macro as",
+            initialdir=str(self.tmp),
+            initialfile="macro.json",
+            defaultextension=".json",
+            filetypes=app_module.MACRO_FILETYPES,
+        )
+
+    def test_a_macro_without_a_file_starts_with_a_new_name_in_the_macros_folder(self):
+        self.macros_dir.mkdir()
+        self.app.macro_path = None
+        self.app.save_macro_as()
+        kwargs = self.filedialog.asksaveasfilename.call_args.kwargs
+        self.assertEqual(kwargs["initialdir"], str(self.macros_dir))
+        self.assertRegex(kwargs["initialfile"], r"^macro-\d{8}-\d{6}\.json$")
+
+    def test_a_folder_that_is_gone_falls_back_to_one_that_exists(self):
+        self.app.macro_path = self.tmp / "gone" / "macro.json"
+        self.app.save_macro_as()
+        self.assertEqual(self.filedialog.asksaveasfilename.call_args.kwargs["initialdir"], str(Path.home()))
+        self.macros_dir.mkdir()
+        self.app.save_macro_as()
+        self.assertEqual(self.filedialog.asksaveasfilename.call_args.kwargs["initialdir"], str(self.macros_dir))
+        self.assertEqual(self.filedialog.asksaveasfilename.call_args.kwargs["initialfile"], "macro.json")
+
+    def test_cancelling_changes_nothing(self):
+        before = self.shown(), self.app.macro_var.get()
+        self.filedialog.asksaveasfilename.return_value = ""
+        self.app.save_macro_as()
+        self.assertEqual((self.shown(), self.app.macro_var.get()), before)
+        self.assertEqual(self.app.macro_path, self.path)
+        self.assertEqual(sorted(p.name for p in self.tmp.iterdir()), ["macro.json"])
+        self.assertNoDialog()
+
+    def test_a_name_without_an_extension_gets_json(self):
+        self.choose(self.tmp / "mine")
+        self.app.save_macro_as()
+        self.assertEqual(self.app.macro_path, self.tmp / "mine.json")
+        self.assertEqual(Recording.load(self.tmp / "mine.json").events, SAMPLE)
+        self.assertFalse((self.tmp / "mine").exists())
+        self.messagebox.askyesno.assert_not_called()
+
+    def test_a_name_without_an_extension_asks_before_replacing_a_file(self):
+        existing = self.write_macro("mine.json", [Event(0.0, "move", 1, 2)])
+        self.choose(self.tmp / "mine")
+        self.messagebox.askyesno.return_value = False
+        self.app.save_macro_as()
+        self.messagebox.askyesno.assert_called_once()
+        self.assertIn("mine.json", self.messagebox.askyesno.call_args.args[1])
+        self.assertEqual(Recording.load(existing).events, [Event(0.0, "move", 1, 2)])
+        self.assertEqual(self.app.macro_path, self.path)
+        self.messagebox.askyesno.return_value = True
+        self.app.save_macro_as()
+        self.assertEqual(Recording.load(existing).events, SAMPLE)
+        self.assertEqual(self.app.macro_path, existing)
+
+    def test_another_extension_is_kept_and_left_to_the_dialog_to_confirm(self):
+        self.choose(self.tmp / "mine.macro")
+        self.app.save_macro_as()
+        self.assertEqual(self.app.macro_path, self.tmp / "mine.macro")
+        self.assertEqual(Recording.load(self.tmp / "mine.macro").events, SAMPLE)
+        self.messagebox.askyesno.assert_not_called()
+
+    def test_saving_over_the_current_file_is_allowed(self):
+        self.choose(self.path)
+        self.app.save_macro_as()
+        self.assertEqual(self.app.macro_path, self.path)
+        self.assertEqual(Recording.load(self.path).events, SAMPLE)
+        self.assertNoDialog()
+
+    def test_a_macro_that_was_never_saved_can_be_saved(self):
+        self.app.macro_path = None
+        self.choose(self.tmp / "first.json")
+        self.app.save_macro_as()
+        self.assertEqual(self.app.macro_path, self.tmp / "first.json")
+        self.assertNotIn("Not saved", self.app.macro_var.get())
+
+    def test_a_failure_is_reported_and_the_current_file_stays(self):
+        self.choose(self.tmp / "mine.json")
+        with mock.patch.object(Recording, "save", side_effect=OSError("read-only")):
+            self.app.save_macro_as()
+        title, message = self.messagebox.showerror.call_args.args[:2]
+        self.assertEqual((title, message), ("Could not save the macro", "read-only"))
+        self.assertEqual(self.app.macro_path, self.path)
+        self.assertIsNotNone(self.app.macro)
+        self.assertEqual(self.enabled(), controls(*IDLE_WITH_MACRO))
+
+    def test_it_needs_a_macro(self):
+        self.app.macro = None
+        self.app.save_macro_as()
+        self.filedialog.asksaveasfilename.assert_not_called()
+
+    def test_it_is_not_offered_while_busy_or_choosing_a_shortcut(self):
+        app = self.app
+        app.change_shortcut("stop")
+        app.save_macro_as()
+        app.change_shortcut("stop")  # cancels
+        app.start_countdown()
+        app.save_macro_as()
+        app.stop_from_button()
+        self.player.block = True
+        app.loop()
+        app.save_macro_as()
+        self.filedialog.asksaveasfilename.assert_not_called()
+
+    def test_the_save_as_button_opens_the_dialog(self):
+        self.app.save_as_button.invoke()
+        self.filedialog.asksaveasfilename.assert_called_once()
+
+    def test_the_shortcuts_work_again_when_the_dialog_fails(self):
+        self.filedialog.asksaveasfilename.side_effect = RuntimeError("no dialog")
+        with self.assertRaises(RuntimeError):
+            self.app.save_macro_as()
+        self.assertFalse(self.app.dialog_open)
+
+
+class DialogScenarios:
+    """While a dialog is up, the shortcuts that would start something are ignored.
+
+    What the window does while a dialog is showing depends on the system and on what opened the dialog: it may go
+    on handling messages, or stand still until the dialog closes. The same scenarios run both ways.
+    """
+
+    polling = False
+
+    def user_presses_keys(self, *actions):
+        """A dialog that the user answers late, after pressing `actions` while it was showing."""
+
+        def dialog(*args, **kwargs):
+            self.assertTrue(self.app.dialog_open)
+            for action in actions:
+                self.hotkeys.on_action(action)  # the keyboard thread reports a key the moment it is pressed
+                if self.polling:
+                    self.app._drain()
+            return ""  # cancelled, or "no"
+
+        return dialog
+
+    def assertNothingStarted(self, recordings=0, loops=0):
+        self.app._drain()  # a window that did not handle messages in the dialog does so now that it has closed
+        self.assertIs(self.app.state, State.IDLE)
+        self.assertEqual(self.recorder.starts, recordings)
+        self.assertEqual(len(self.player.calls), loops)
+        self.assertFalse(self.app.dialog_open)
+
+    def test_the_import_dialog(self):
+        self.load_macro()
+        self.filedialog.askopenfilename.reset_mock()  # loading the macro used the dialog already
+        self.filedialog.askopenfilename.side_effect = self.user_presses_keys("record", "loop")
+        self.app.import_macro()
+        self.filedialog.askopenfilename.assert_called_once()
+        self.assertNothingStarted()
+
+    def test_the_save_as_dialog(self):
+        self.load_macro()
+        self.filedialog.asksaveasfilename.side_effect = self.user_presses_keys("record", "loop")
+        self.app.save_macro_as()
+        self.filedialog.asksaveasfilename.assert_called_once()
+        self.assertNothingStarted()
+
+    def test_the_question_about_replacing_a_file(self):
+        self.load_macro()
+        taken = self.write_macro("taken.json")
+        self.filedialog.asksaveasfilename.return_value = str(taken.with_suffix(""))
+        self.messagebox.askyesno.side_effect = self.user_presses_keys("record", "loop")
+        self.app.save_macro_as()
+        self.messagebox.askyesno.assert_called_once()
+        self.assertNothingStarted()
+
+    def test_an_error_about_the_loop_settings(self):
+        self.load_macro()
+        self.app.times_var.set("abc")
+        self.messagebox.showerror.side_effect = self.user_presses_keys("record", "loop")
+        self.press("loop")
+        self.messagebox.showerror.assert_called_once()
+        self.assertNothingStarted()
+
+    def test_a_warning_that_nothing_was_recorded(self):
+        self.load_macro()
+        self.recorder.events = []
+        self.press("record")
+        self.messagebox.showwarning.side_effect = self.user_presses_keys("record", "loop")
+        self.app.stop_from_button()
+        self.messagebox.showwarning.assert_called_once()
+        self.assertNothingStarted(recordings=1)
+
+    def test_an_error_about_a_recorder_that_cannot_start(self):
+        self.load_macro()
+        self.recorder.start_error = RuntimeError("no access")
+        self.messagebox.showerror.side_effect = self.user_presses_keys("record", "loop")
+        self.press("record")
+        self.messagebox.showerror.assert_called_once()
+        self.assertNothingStarted()
+
+    def test_an_error_about_a_macro_that_failed(self):
+        self.load_macro()
+        self.player.error = RuntimeError("boom")
+        self.messagebox.showerror.side_effect = self.user_presses_keys("record", "loop")
+        self.app.repeat()
+        self.finish_worker()
+        self.messagebox.showerror.assert_called_once()
+        self.assertNothingStarted(loops=1)
+
+    def test_a_warning_about_a_shortcut_that_cannot_be_used(self):
+        self.load_macro()
+        self.messagebox.showwarning.side_effect = self.user_presses_keys("record", "loop")
+        self.app.change_shortcut("loop")
+        self.hotkeys.capture("f2")  # the key that stops
+        self.app._drain()
+        self.messagebox.showwarning.assert_called_once()
+        self.assertNothingStarted()
+
+    def test_the_shortcuts_work_again_once_the_dialog_has_closed(self):
+        self.load_macro()
+        self.filedialog.askopenfilename.side_effect = self.user_presses_keys("record", "loop")
+        self.app.import_macro()
+        self.press("record")
+        self.assertIs(self.app.state, State.RECORDING)
+
+
+class DialogGuardTests(DialogScenarios, AppTestCase):
+    """The window stands still while the dialog is up, as it does when the dialog was opened by a message."""
+
+    def test_a_key_that_starts_something_does_not_even_reach_the_window(self):
+        with self.app._dialogs():
+            self.hotkeys.on_action("record")
+            self.hotkeys.on_action("loop")
+        self.assertTrue(self.app.messages.empty())
+
+    def test_a_key_that_was_pressed_just_before_the_dialog_opened_is_ignored_too(self):
+        self.load_macro()
+        self.hotkeys.on_action("record")  # reported, but the window has not handled it yet
+
+        def handle_messages_in_the_dialog(**kwargs):
+            self.app._drain()
+            return ""
+
+        self.filedialog.askopenfilename.side_effect = handle_messages_in_the_dialog
+        self.app.import_macro()
+        self.assertNothingStarted()
+
+    def test_stopping_and_pausing_are_not_ignored(self):
+        self.load_macro()
+        self.player.block = True
+        self.app.loop()
+        with self.app._dialogs():
+            self.press("pause")
+            self.press("stop")
+        self.assertTrue(self.app.pause_requested.is_set())
+        self.assertTrue(self.app.stop_requested.is_set())
+        self.finish_worker()
+
+    def test_a_dialog_inside_a_dialog_does_not_lift_the_guard_when_it_closes(self):
+        with self.app._dialogs():
+            with self.app._dialogs():
+                self.assertTrue(self.app.dialog_open)
+            self.assertTrue(self.app.dialog_open)
+        self.assertFalse(self.app.dialog_open)
+
+
+class DialogGuardWhilePollingTests(DialogScenarios, AppTestCase):
+    """The window goes on handling messages while the dialog is up, as it does on Windows for a button's dialog."""
+
+    polling = True
+
+
+class FolderButtonTests(AppTestCase):
+    def test_it_shows_the_macro_in_the_file_manager(self):
+        path = self.load_macro()
+        self.app.folder_button.invoke()
+        self.show_in_file_manager.assert_called_once_with(path)
+        self.assertNoDialog()
+
+    def test_it_is_for_the_macro_that_is_selected_now(self):
+        self.load_macro("first.json")
+        second = self.load_macro("second.json")
+        self.app.show_macro_folder()
+        self.show_in_file_manager.assert_called_once_with(second)
+
+    def test_a_new_recording_can_be_shown_right_away(self):
+        self.press("record")
+        self.press("stop")
+        self.assertTrue(self.enabled()["folder"])
+        self.app.show_macro_folder()
+        self.show_in_file_manager.assert_called_once_with(self.app.macro_path)
+        self.assertEqual(self.app.macro_path.parent, self.macros_dir)
+
+    def test_after_save_as_it_points_to_the_new_file(self):
+        self.load_macro()
+        chosen = self.tmp / "saved.json"
+        self.filedialog.asksaveasfilename.return_value = str(chosen)
+        self.app.save_macro_as()
+        self.app.show_macro_folder()
+        self.show_in_file_manager.assert_called_once_with(chosen)
+
+    def test_it_is_disabled_without_a_file_and_looks_it(self):
+        app = self.app
+
+        def icon():
+            return str(app.folder_button.cget("image")[0])
+
+        self.assertFalse(self.enabled()["folder"])
+        self.assertEqual(icon(), str(app.folder_icon_disabled))
+        app.macro = Recording(list(SAMPLE))  # a macro that was never saved
+        app._refresh_macro_info()
+        self.assertFalse(self.enabled()["folder"])
+        app.show_macro_folder()
+        self.show_in_file_manager.assert_not_called()
+        self.load_macro()
+        self.assertTrue(self.enabled()["folder"])
+        self.assertEqual(icon(), str(app.folder_icon))
+
+    def test_a_failure_is_reported_with_the_name_of_the_file_manager(self):
+        self.load_macro()
+        self.show_in_file_manager.side_effect = OSError("it is gone")
+        self.app.show_macro_folder()
+        title, message = self.messagebox.showerror.call_args.args[:2]
+        self.assertEqual(title, f"Could not open {app_module.filemanager.file_manager_name()}")
+        self.assertEqual(message, "it is gone")
+        self.assertIs(self.app.state, State.IDLE)
+
+    def test_nothing_is_opened_while_busy_or_choosing_a_shortcut(self):
+        self.load_macro()
+        app = self.app
+        app.change_shortcut("stop")
+        app.show_macro_folder()
+        app.change_shortcut("stop")  # cancels
+        app.start_countdown()
+        app.show_macro_folder()
+        app.stop_from_button()
+        self.player.block = True
+        app.loop()
+        app.show_macro_folder()
+        self.show_in_file_manager.assert_not_called()
+
+    def test_the_tooltip_names_the_file_manager(self):
+        with mock.patch.object(app_module, "Tooltip") as tooltip:
+            self.launch()
+        tooltip.assert_called_once_with(
+            self.app.folder_button, f"Show in {app_module.filemanager.file_manager_name()}"
+        )
+
+
 class CloseTests(AppTestCase):
     def test_closing_while_idle(self):
         self.app.close()
@@ -1008,6 +1718,17 @@ class CloseTests(AppTestCase):
         self.load_macro()
         self.player.block = True
         self.app.loop()
+        worker = self.app.worker
+        self.app.close()
+        self.assertTrue(self.app.stop_requested.is_set())
+        self.assertFalse(worker.is_alive())
+        self.assertDestroyed()
+
+    def test_closing_while_paused_does_not_hang(self):
+        self.load_macro()
+        self.player.block = True
+        self.app.loop()
+        self.press("pause")
         worker = self.app.worker
         self.app.close()
         self.assertTrue(self.app.stop_requested.is_set())
@@ -1075,13 +1796,19 @@ class LayoutTests(AppTestCase):
         sizes.append(self.size())
         app._handle_status("Waiting", "Run 12 of 100 starts in 59 min 59 s")
         sizes.append(self.size())
+        self.press("pause")
+        sizes.append(self.size())  # "Pausing", and the Loop button now says "Resume"
+        app._handle_status("Paused", "Run 12 of 100 starts in 59 min 59 s")
+        sizes.append(self.size())
+        self.press("loop")
+        sizes.append(self.size())
         self.assertEqual(len(set(sizes)), 1, sizes)
 
     def test_the_status_text_fits_the_space_reserved_for_it(self):
         app = self.app
         label = detail_label(app)
         room = label.master.winfo_reqheight()
-        app.keys.update(record="page_down", stop="page_up")  # the widest labels
+        app.keys.update(record="page_down", stop="page_up", loop="page_down", pause="page_up")  # the widest labels
         texts = []
         for state in (State.IDLE, State.COUNTDOWN, State.RECORDING, State.PLAYING):
             app._set_state(state)
@@ -1091,6 +1818,10 @@ class LayoutTests(AppTestCase):
         for detail in ("Run 12 of 100", "Run 12 of 100 starts in 59 min 59 s"):
             app._handle_status("Waiting", detail)  # the state is PLAYING
             texts.append(app.detail_var.get())
+        app.pause()
+        texts.append(app.detail_var.get())
+        app._handle_status("Paused", "Run 12 of 100 starts in 59 min 59 s")
+        texts.append(app.detail_var.get())
         for text in texts:
             with self.subTest(text):
                 app.detail_var.set(text)
